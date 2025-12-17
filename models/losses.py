@@ -101,3 +101,73 @@ class ACTLossHead(nn.Module):
 
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
 
+
+class TrajectoryLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        # SmoothL1Loss is often better than MSE for trajectories as it's less sensitive to outliers
+        self.reg_loss = nn.SmoothL1Loss(reduction='none') 
+
+    def forward(self, pred_traj, target_traj, valid_mask):
+        """
+        Args:
+            pred_traj: [Batch, Agents, Future, 2]
+            target_traj: [Batch, Future, Agents, 7] (From NuScenes dataloader)
+            valid_mask: [Batch, Future, Agents] (1 if agent exists, 0 if padding)
+        """
+        # 1. Align Target Shape: [B, T, N, 7] -> [B, N, T, 7]
+        target_traj = target_traj.permute(0, 2, 1, 3)
+        valid_mask = valid_mask.permute(0, 2, 1) # [B, N, T]
+
+        # 2. Slice Target: We only want (x, y), usually the first 2 indices
+        gt_xy = target_traj[..., :2] 
+
+        # 3. Calculate Loss (Smooth L1)
+        # loss dimensions: [B, N, T, 2]
+        loss = self.reg_loss(pred_traj, gt_xy)
+        
+        # 4. Average over (x, y) dimensions
+        loss = loss.mean(dim=-1) # [B, N, T]
+
+        # 5. Apply Masking (Ignore non-existent agents)
+        # valid_mask needs to match shape. 
+        # Note: NuScenes mask might be for history. Ensure you have a FUTURE mask.
+        # If your 'obs_mask' is only for history, you might assume if it existed in history,
+        # it exists in future, OR use the target values themselves (if 0,0,0,0 means empty).
+        
+        # Assuming valid_mask is provided for the future steps:
+        masked_loss = loss * valid_mask
+        
+        # 6. Normalize by number of valid elements to keep loss magnitude consistent
+        num_valid = valid_mask.sum() + 1e-6 # Avoid div by zero
+        return masked_loss.sum() / num_valid
+
+def calculate_metrics(pred_traj, target_traj, valid_mask):
+    """
+    Calculates ADE (Average Displacement Error) and FDE (Final Displacement Error)
+    """
+    with torch.no_grad():
+        # Align Target: [B, T, N, 7] -> [B, N, T, 2]
+        gt_xy = target_traj.permute(0, 2, 1, 3)[..., :2]
+        valid_mask = valid_mask.permute(0, 2, 1)
+
+        # Displacement: Euclidean distance between pred and gt
+        # shape: [B, N, T]
+        displacement = torch.norm(pred_traj - gt_xy, dim=-1)
+
+        # Apply mask
+        masked_displacement = displacement * valid_mask
+        
+        # Sum of valid agents per sample (or total)
+        num_valid = valid_mask.sum() + 1e-6
+
+        # --- ADE: Average over all Time Steps ---
+        ade = masked_displacement.sum() / num_valid
+
+        # --- FDE: Displacement at the Last Time Step ---
+        final_displacement = displacement[:, :, -1]      # [B, N]
+        final_mask = valid_mask[:, :, -1]                # [B, N]
+        
+        fde = (final_displacement * final_mask).sum() / (final_mask.sum() + 1e-6)
+
+        return ade.item(), fde.item()

@@ -17,11 +17,12 @@ from models.recursive_reasoning.trm_unimodal import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
-
 SAMPLE_FREQ = 2
 max_obstacles = 30
 n_history = 2*SAMPLE_FREQ # current time inclusive
-n_horizon = 6*SAMPLE_FREQ
+n_horizon = 2*SAMPLE_FREQ
+
+print(f"n_history: {n_history}, n_horizon: {n_horizon}")
 
 '''
 Standalone demo of how to use the preprocessed nuscenes data.
@@ -119,13 +120,13 @@ class NuScenesDataset(Dataset):
         self.obs_mask = torch.from_numpy(data['obs_mask'])                  # (n_examples, n_history, MAX_OBSTACLES)
         self.camera_files = data['camera']                                  # filepaths: (n_examples, n_history)
         self.lidar_files = data['lidar']                                    # filepaths: (n_examples, n_history)
-        self.targets = torch.from_numpy(data['targets']).float()            # (n_examples, n_horizon, MAX_OBSTACLES, 7)
-        self.targets_mask = torch.from_numpy(data['targets_mask'])          # (n_examples, n_horizon, MAX_OBSTACLES)
+        self.targets = torch.from_numpy(data['targets'])[:, :n_horizon, :].float()            # (n_examples, n_horizon, MAX_OBSTACLES, 7)
+        self.targets_mask = torch.from_numpy(data['targets_mask'])[:, :n_horizon, :]          # (n_examples, n_horizon, MAX_OBSTACLES)
 
         self.ego_pose = torch.from_numpy(data['ego_pose']).float()          # (n_examples, n_history, 7)
         self.raw_obs_pose = torch.from_numpy(data['raw_obs_pose']).float()  # (n_examples, n_history, MAX_OBSTACLES, 7)
-        self.ego_target = torch.from_numpy(data['ego_target']).float()      # (n_examples, n_horizon, 7)
-        self.raw_target = torch.from_numpy(data['raw_target']).float()      # (n_examples, n_horizon, MAX_OBSTACLES, 7)
+        self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].float()      # (n_examples, n_horizon, 7)
+        self.raw_target = torch.from_numpy(data['raw_target'])[:, :n_horizon, :].float()      # (n_examples, n_horizon, MAX_OBSTACLES, 7)
         self.obs_type = data['obs_type' ]                                   # strings: (n_examples, n_history, MAX_OBSTACLES)
 
         if 'bev' in data: # necessary for old versions where bev is not in data
@@ -303,7 +304,7 @@ def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
 import matplotlib.pyplot as plt
 
 # plot for only one object in one sample
-def plot_trajectories(pred_traj, target_traj, title="Trajectories", filename = "model_default"):
+def plot_trajectories(pred_traj, target_traj, mask, title="Trajectories", RUN_NAME="model", filename = "model_default"):
     """
     pred_traj: [Future, 2]
     target_traj: [Future, 7]
@@ -312,36 +313,90 @@ def plot_trajectories(pred_traj, target_traj, title="Trajectories", filename = "
     plt.title(title)
     plt.xlabel("X")
     plt.ylabel("Y")
-    
+    mask = mask > 0
     # Plot predicted trajectory
-    plt.plot(pred_traj[:, 0].detach().cpu(), pred_traj[:, 1].detach().cpu(), 'ro--', label="Predicted")
     
+    plt.plot(pred_traj[:, 0].detach().cpu(), pred_traj[:, 1].detach().cpu(), 'ro--', label="Predicted", alpha=0.6)
+    
+    # Add index labels for Predicted
+    for i, (x, y) in enumerate(pred_traj.detach().cpu()):
+        plt.text(x, y, str(i), fontsize=9, color='black', alpha=0.8)
+
     # Plot ground truth trajectory
-    plt.plot(target_traj[:, 0].detach().cpu(), target_traj[:, 1].detach().cpu(), 'go--', label="Ground Truth")
-    
+    #plt.plot(target_traj[:, 0].detach().cpu(), target_traj[:, 1].detach().cpu(), 'go--', label="Ground Truth")
+    plt.plot(target_traj[mask, 0].detach().cpu(), target_traj[mask, 1].detach().cpu(), 'go--', label="Ground Truth", alpha=0.6)
+
+    # Add index labels for Predicted
+    for i, (x, y) in enumerate(target_traj[mask].detach().cpu()):
+        plt.text(x, y, str(i), fontsize=9, color='blue', alpha=0.8)
+
     plt.legend()
     plt.axis('equal')
     plt.grid(True)
-    save_path = f'plot_figures/{filename}.png'
+    save_path = f'plot_figures/{RUN_NAME}/{filename}.png'
    
-    os.makedirs("plot_figures", exist_ok=True)
+    os.makedirs(f"plot_figures/{RUN_NAME}", exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to: {save_path}")
 
     #plt.show()
 
-def run_act_steps(model, batch, carry):
-    """
-    If halt_max_steps==1, this is just one forward.
-    If >1, it loops until all sequences halted or max steps hit.
-    """
+# def run_act_steps(model, batch, carry):
+#     """
+#     If halt_max_steps==1, this is just one forward.
+#     If >1, it loops until all sequences halted or max steps hit.
+#     """
+#     outputs = None
+#     print("Running ACT steps...", model.config.halt_max_steps)
+#     for _ in range(model.config.halt_max_steps):
+#         carry, outputs = model(carry, batch)
+#         # if training and ACT enabled, you can early stop when all halted
+#         if carry.halted.all():
+#             break
+#     return carry, outputs
+
+def run_act_steps(
+    model,
+    model_input,            # {"obs_pose","obs_mask"} on device
+    carry,
+    *,
+    targets=None,           # [B,H,A,7] optional
+    targets_mask=None,      # [B,H,A] optional
+    out_slice=2,
+    optimizer=None,
+    do_opt_step=False,
+    grad_clip=1.0,
+    early_stop=True,
+):
     outputs = None
+    losses = []
+
     for _ in range(model.config.halt_max_steps):
-        carry, outputs = model(carry, batch)
-        # if training and ACT enabled, you can early stop when all halted
-        if carry.halted.all():
+        carry, outputs = model(carry, model_input)
+
+        if targets is not None and targets_mask is not None:
+            pred = outputs["pred"]
+            loss = traj_loss_smooth_l1_from_batch(pred, targets, targets_mask, out_slice=out_slice)
+            losses.append(loss)
+
+            if do_opt_step:
+                assert optimizer is not None
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+
+        if early_stop and carry.halted.all():
             break
-    return carry, outputs
+
+    loss_avg = None
+    if losses:
+        loss_avg = torch.stack([l.detach() for l in losses]).mean().item()
+
+    return carry, outputs, {"loss_avg": loss_avg, "segments": len(losses)}
+
+
 
 # Assumes these exist elsewhere in your codebase:
 # - TRM_ACT_NuScenes
@@ -391,8 +446,22 @@ def plot_debug_batch(model, batch, device, epoch, run_name, out_slice):
 
         model_input = {"obs_pose": obs_pose, "obs_mask": obs_mask}
         carry = model.initial_carry(model_input)
-        carry, outputs = run_act_steps(model, model_input, carry)
-        pred = outputs["pred"]  # [B, A, H, out_dim]
+        # carry, outputs = run_act_steps(model, model_input, carry)
+        # pred = outputs["pred"]  # [B, A, H, out_dim]
+        carry, outputs, stats = run_act_steps(
+                                            model,
+                                            model_input,
+                                            carry,
+                                            targets=targets,
+                                            targets_mask=targets_mask,
+                                            out_slice=out_slice,
+                                            optimizer=None,
+                                            do_opt_step=False,      # <-- key for eval
+                                            grad_clip=None,
+                                            early_stop=False
+                                    )
+
+        pred = outputs["pred"]
 
         B, A, H, _ = pred.shape
         max_agents_to_plot = min(4, A)
@@ -400,10 +469,13 @@ def plot_debug_batch(model, batch, device, epoch, run_name, out_slice):
         for i in range(max_agents_to_plot):
             pred_xy = pred[0, i, :, :2].detach().cpu()
             gt_xy = targets[0, :, i, :2].detach().cpu()
+            targets_mask_cpu = targets_mask[0, :, i].detach().cpu()
             plot_trajectories(
                 pred_xy,
                 gt_xy,
+                targets_mask_cpu,
                 title=f"[Debug] Agent {i} @ epoch {epoch}",
+                RUN_NAME=run_name,
                 filename=f"{run_name}_debug_epoch{epoch}_agent{i}",
             )
 
@@ -436,9 +508,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
     # --- Infer key dims from a real batch (prevents config mismatch) ---
     sample = next(iter(tr_dataloader))
-    n_history = sample["obs_pose"].shape[1]
-    max_obstacles = sample["obs_pose"].shape[2]
-    n_horizon = sample["targets"].shape[1]
+    # n_history = sample["obs_pose"].shape[1]
+    # max_obstacles = sample["obs_pose"].shape[2]
+    # n_horizon = sample["targets"].shape[1]
 
     # --- Check for resume ---
     last_ckpt_path = os.path.join(run_ckpt_dir, "last.pth")
@@ -456,6 +528,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
     else:
         # --- Fresh config (for TRM_ACT_NuScenes) ---
+        print("Horizon", n_horizon)
         config_dict = {
             "batch_size": args.config_batch_size,  # logical batch size; dataloader can differ
             "n_history": n_history,
@@ -560,21 +633,36 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             }
 
             carry = model.initial_carry(model_input)
-            carry, outputs = run_act_steps(model, model_input, carry)
-            pred = outputs["pred"]  # [B, A, H, out_dim]
+            # carry, outputs = run_act_steps(model, model_input, carry)
+            # pred = outputs["pred"]  # [B, A, H, out_dim]
 
-            loss = traj_loss_smooth_l1_from_batch(
-                pred, targets, targets_mask, out_slice=config_dict["out_slice"]
-            )
+            # loss = traj_loss_smooth_l1_from_batch(
+            #     pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+            # )
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # optimizer.zero_grad(set_to_none=True)
+            # loss.backward()
+            # clip_grad_norm_(model.parameters(), 1.0)
+            # optimizer.step()
 
-            global_step += 1
-            running_loss += loss.item()
-
+            # global_step += 1
+            # running_loss += loss.item()
+            
+            carry, outputs, stats = run_act_steps(
+                                            model,
+                                            model_input,
+                                            carry,
+                                            targets=targets,
+                                            targets_mask=targets_mask,
+                                            out_slice=config_dict["out_slice"],
+                                            optimizer=optimizer,
+                                            do_opt_step=True,      # <-- key for training
+                                            grad_clip=1.0,
+                                            early_stop=True
+                                    )
+            global_step += stats["segments"]
+            running_loss += stats["loss_avg"]
+            pred = outputs["pred"]
             ade, fde = compute_ade_fde(
                 pred, targets, targets_mask, out_slice=config_dict["out_slice"]
             )
@@ -631,7 +719,22 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
                 model_input = {"obs_pose": obs_pose, "obs_mask": obs_mask}
                 carry = model.initial_carry(model_input)
-                carry, outputs = run_act_steps(model, model_input, carry)
+                # carry, outputs = run_act_steps(model, model_input, carry)
+                # pred = outputs["pred"]
+
+                carry, outputs, stats = run_act_steps(
+                                            model,
+                                            model_input,
+                                            carry,
+                                            targets=targets,
+                                            targets_mask=targets_mask,
+                                            out_slice=config_dict["out_slice"],
+                                            optimizer=None,
+                                            do_opt_step=False,      # <-- key for eval
+                                            grad_clip=None,
+                                            early_stop=False
+                                    )
+
                 pred = outputs["pred"]
 
                 ade, fde = compute_ade_fde(
@@ -643,7 +746,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
                 targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
                 #targets_xy_denorm = targets_xy_denorm.permute(0, 2, 1, 3)       # [B, A, H, 2]
-                print()
+                #print()
                 ade_real, fde_real = compute_ade_fde(
                     pred_xy_denorm, targets_xy_denorm, targets_mask, out_slice=config_dict["out_slice"]
                 )
@@ -651,10 +754,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 val_ade_real_sum += ade_real
                 val_fde_real_sum += fde_real
 
-                batch_loss = traj_loss_smooth_l1_from_batch(
-                    pred, targets, targets_mask, out_slice=config_dict["out_slice"]
-                )
-                val_loss_sum += batch_loss.item()
+                # batch_loss = traj_loss_smooth_l1_from_batch(
+                #     pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+                # )
+                #val_loss_sum += batch_loss.item()
+                val_loss_sum += stats["loss_avg"]
 
                 val_n += 1
 
@@ -738,7 +842,22 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
                     model_input = {"obs_pose": obs_pose, "obs_mask": obs_mask}
                     carry = model.initial_carry(model_input)
-                    carry, outputs = run_act_steps(model, model_input, carry)
+                    # carry, outputs = run_act_steps(model, model_input, carry)
+                    # pred = outputs["pred"]
+
+                    carry, outputs, stats = run_act_steps(
+                                            model,
+                                            model_input,
+                                            carry,
+                                            targets=targets,
+                                            targets_mask=targets_mask,
+                                            out_slice=config_dict["out_slice"],
+                                            optimizer=None,
+                                            do_opt_step=False,      # <-- key for eval
+                                            grad_clip=None,
+                                            early_stop=False
+                                    )
+
                     pred = outputs["pred"]
 
                     ade, fde = compute_ade_fde(
@@ -758,10 +877,12 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     ood_ade_real_sum += ade_real
                     ood_fde_real_sum += fde_real
 
-                    batch_loss = traj_loss_smooth_l1_from_batch(
-                        pred, targets, targets_mask, out_slice=config_dict["out_slice"]
-                    )
-                    ood_loss_sum += batch_loss.item()
+                    # batch_loss = traj_loss_smooth_l1_from_batch(
+                    #     pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+                    # )
+                    # ood_loss_sum += batch_loss.item()
+                    ood_loss_sum += stats["loss_avg"]
+
 
                     ood_n += 1
 
@@ -786,7 +907,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 ood_debug_batch,
                 device,
                 epoch=epoch+1,
-                run_name=RUN_NAME,
+                run_name=RUN_NAME + "_ood",
                 out_slice=config_dict["out_slice"],
             )
 
@@ -870,7 +991,7 @@ if __name__ == "__main__":
     # Optional CUDA debug envs (you can comment these out if you don't want sync execution)
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
     os.environ["TORCH_USE_CUDA_DSA"] = "1"
-
+    
 
     tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size)
     train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy)
