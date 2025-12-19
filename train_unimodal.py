@@ -8,6 +8,7 @@ import datetime
 import json
 import importlib
 import models.recursive_reasoning.trm_unimodal as trm_unimodal
+from torch.utils.tensorboard import SummaryWriter
 
 importlib.reload(trm_unimodal)
 # --- IMPORTS ---
@@ -510,9 +511,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     RUN_NAME = args.run_name
     LOG_DIR = "logs"
     CKPT_DIR = "checkpoints"
+    TBOARD_DIR = "tboard"
     run_ckpt_dir = os.path.join(CKPT_DIR, RUN_NAME)
     os.makedirs(run_ckpt_dir, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(TBOARD_DIR, exist_ok=True)
 
     # Seeds for reproducibility (also used for picking debug batch)
     random.seed(args.seed)
@@ -602,6 +605,10 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             f"Resuming from checkpoint at epoch {start_epoch}, "
             f"global_step {global_step}, best_val_loss={best_val_loss:.4f}"
         )
+    
+    # Set up tensorboard
+    datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+    tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}_{datetimestr}'))
 
     # --- Model & optimizer ---
     logger.log("Initializing Model...")
@@ -636,12 +643,21 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         logger.log(f"\n=== Starting Epoch {epoch+1}/{args.epochs} ===")
         model.train()
 
+        # step-wise stats
         running_loss = 0.0
         running_ade = 0.0
         running_fde = 0.0
         running_ade_real = 0.0
         running_fde_real = 0.0
         running_count = 0
+
+        # epoch-wise stats
+        tr_ade_sum = 0.0
+        tr_fde_sum = 0.0
+        tr_ade_real_sum = 0.0
+        tr_fde_real_sum = 0.0
+        tr_loss_sum = 0.0
+        tr_n = 0
 
         for batch_idx, batch in enumerate(tr_dataloader):
             obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
@@ -721,6 +737,20 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 )
                 running_loss = running_ade = running_fde = running_ade_real = running_fde_real = 0.0
                 running_count = 0
+
+            tr_ade_sum += ade
+            tr_fde_sum += fde
+            tr_ade_real_sum += ade_real
+            tr_fde_real_sum += fde_real
+            tr_loss_sum += stats["loss_avg"]
+            tr_n += 1
+
+        # tensorboard logging
+        tbd_writer.add_scalar(f"Loss/train", tr_loss_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"ADE/train", tr_ade_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"FDE/train", tr_fde_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"ADE_real/train", tr_ade_real_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"FDE_real/train", tr_fde_real_sum / max(tr_n, 1), epoch+1)
 
         # --- Validation ---
         logger.log("Running Validation...")
@@ -802,6 +832,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             f"Real ADE: {val_ade_real:.4f} | "
             f"Real FDE: {val_fde_real:.4f}"
         )
+
+        # tensorboard logging
+        tbd_writer.add_scalar(f"Loss/val",val_loss,epoch+1)
+        tbd_writer.add_scalar(f"ADE/val",val_ade,epoch+1)
+        tbd_writer.add_scalar(f"FDE/val",val_fde,epoch+1)
+        tbd_writer.add_scalar(f"ADE_real/val",val_ade_real,epoch+1)
+        tbd_writer.add_scalar(f"FDE_real/val",val_fde_real,epoch+1)
 
         # --- Plot debug batch AFTER this epoch ---
         plot_debug_batch(
@@ -927,6 +964,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 f"Real FDE: {ood_fde_real:.4f}"
             )
 
+            # tensorboard logging
+            tbd_writer.add_scalar(f"Loss/ood",ood_loss,epoch+1)
+            tbd_writer.add_scalar(f"ADE/ood",ood_ade,epoch+1)
+            tbd_writer.add_scalar(f"FDE/ood",ood_fde,epoch+1)
+            tbd_writer.add_scalar(f"ADE_real/ood",ood_ade_real,epoch+1)
+            tbd_writer.add_scalar(f"FDE_real/ood",ood_fde_real,epoch+1)
+
             # --- Plot debug batch AFTER this epoch ---
             plot_debug_batch(
                 model,
@@ -941,6 +985,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
     logger.log("Training Complete.")
 
+    # tboard
+    tbd_writer.flush()
+    tbd_writer.close()
 
 def load_dataset(split_type="standard", batch_size=16, use_camera=False, use_lidar=False, use_bev=False):
     print("Loading Dataset...")
