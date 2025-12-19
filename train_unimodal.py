@@ -272,7 +272,7 @@ class NuScenesDataset(Dataset):
     def set_norm_stats(self, stats):
         self.norm_stats = stats
 
-    def get_norm_stats(Self, stats):
+    def get_norm_stats(self, stats):
         return self.norm_stats
     
     def normalize_positions(self, pos):
