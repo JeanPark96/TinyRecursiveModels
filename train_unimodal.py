@@ -268,6 +268,12 @@ class NuScenesDataset(Dataset):
             "count": count,
         }
         return stats
+
+    def set_norm_stats(self, stats):
+        self.norm_stats = stats
+
+    def get_norm_stats(Self, stats):
+        return self.norm_stats
     
     def normalize_positions(self, pos):
         """
@@ -954,9 +960,8 @@ def load_dataset(split_type="standard", batch_size=16, use_camera=False, use_lid
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
-
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
-    print(f'Loaded normalized train dataset! {len(tr_dataset)}')
+    tr_dataset.set_norm_stats(stats)
+    print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
     val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
