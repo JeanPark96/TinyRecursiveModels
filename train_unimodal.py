@@ -207,13 +207,13 @@ class NuScenesDataset(Dataset):
             'idx': idx,                             # scalar
         }
         if self.use_camera:
-            camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])
-            sample['camera'] = camera_seq,           # list of n_history tensors
+            camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])          
+            sample.update(camera=camera_seq)        # list of n_history tensors
         if self.use_lidar:
             lidar_seq  = [self.lidar_loader(f).tolist() for f in self.lidar_files[idx]]
-            sample['lidar'] = lidar_seq,             # list of n_history tensors
+            sample.update(lidar=lidar_seq)          # list of n_history tensors
         if self.use_bev:
-            sample['bev'] = self.bev[idx]            # (n_history, 4, 256, 256)
+            sample.update(bev=self.bev[idx])        # (n_history, 4, 256, 256)
         
         return sample
 
