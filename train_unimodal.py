@@ -100,39 +100,55 @@ def custom_collate(batch):
     collated['org_obs_pose'] = torch.stack([b['org_obs_pose'] for b in batch])
     collated['org_targets']  = torch.stack([b['org_targets'] for b in batch])
     collated['targets_mask']  = torch.stack([b['targets_mask'] for b in batch])
-    collated['camera'] = torch.stack([b['camera'] for b in batch])
     collated['idx'] = np.stack([b['idx'] for b in batch])
 
-    # lidar is list of variable-length tensors → DO NOT stack
-    collated['lidar'] = [b['lidar'] for b in batch]
-
-    # bev field is not in every dataset
+    # sensor data is not always used
+    if 'camera' in batch[0]:
+        collated['camera'] = torch.stack([b['camera'] for b in batch])
+    if 'lidar' in batch[0]:
+        collated['lidar'] = [b['lidar'] for b in batch]
     if 'bev' in batch[0]:
         collated['bev'] = np.stack([b['bev'] for b in batch])
 
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, norm_stats=True):
+    def __init__(self, data_pth, raw_data_dir, use_camera=False, use_lidar=False, use_bev=False, norm_stats=True):
+        self.use_camera = use_camera
+        self.use_lidar = use_lidar
+        self.use_bev = use_bev
+        
+        # load dataset
         data = np.load(data_pth, allow_pickle=True)
+
+        # pose normalization statistics
         self.norm_stats = norm_stats
-        self.obs_pose = torch.from_numpy(data['obs_pose']).float()          # (n_examples, n_history, MAX_OBSTACLES, 7)
+
+        # agent masks
         self.obs_mask = torch.from_numpy(data['obs_mask'])                  # (n_examples, n_history, MAX_OBSTACLES)
-        self.camera_files = data['camera']                                  # filepaths: (n_examples, n_history)
-        self.lidar_files = data['lidar']                                    # filepaths: (n_examples, n_history)
-        self.targets = torch.from_numpy(data['targets'])[:, :n_horizon, :].float()            # (n_examples, n_horizon, MAX_OBSTACLES, 7)
         self.targets_mask = torch.from_numpy(data['targets_mask'])[:, :n_horizon, :]          # (n_examples, n_horizon, MAX_OBSTACLES)
 
+        # agent type
+        self.obs_type = data['obs_type' ]                                   # strings: (n_examples, n_history, MAX_OBSTACLES)
+
+        # ego-centric pose
+        self.obs_pose = torch.from_numpy(data['obs_pose']).float()          # (n_examples, n_history, MAX_OBSTACLES, 7)
+        self.targets = torch.from_numpy(data['targets'])[:, :n_horizon, :].float()            # (n_examples, n_horizon, MAX_OBSTACLES, 7)
+        
+        # global frame pose
         self.ego_pose = torch.from_numpy(data['ego_pose']).float()          # (n_examples, n_history, 7)
         self.raw_obs_pose = torch.from_numpy(data['raw_obs_pose']).float()  # (n_examples, n_history, MAX_OBSTACLES, 7)
         self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].float()      # (n_examples, n_horizon, 7)
         self.raw_target = torch.from_numpy(data['raw_target'])[:, :n_horizon, :].float()      # (n_examples, n_horizon, MAX_OBSTACLES, 7)
-        self.obs_type = data['obs_type' ]                                   # strings: (n_examples, n_history, MAX_OBSTACLES)
-
-        if 'bev' in data: # necessary for old versions where bev is not in data
-            self.bev = data['bev']                                          # None or (n_examples, n_history, 4, 256, 256)
-        else:
-            self.bev = None
+        
+        # optional sensor data
+        if self.use_camera: self.camera_files = data['camera']        # filepaths: (n_examples, n_history)
+        if self.use_lidar: self.lidar_files = data['lidar']            # filepaths: (n_examples, n_history)
+        if self.use_bev:
+            if 'bev' in data: # necessary for old versions where bev is not in data
+                self.bev = data['bev']                                          # None or (n_examples, n_history, 4, 256, 256)
+            else:
+                raise IndexError('Data type bev is not in this dataset.')
 
         self.n_samples = self.obs_pose.shape[0]
         self.raw_data_dir = raw_data_dir
@@ -174,27 +190,31 @@ class NuScenesDataset(Dataset):
         return torch.from_numpy(points)
 
     def __getitem__(self, idx):
-        # Load history camera / lidar sequences
-        camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])
-        lidar_seq  = [self.lidar_loader(f).tolist() for f in self.lidar_files[idx]]
-        # Normalized versions (xyz only)
+        # Normalized pose (xyz only)
         norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
         norm_targets  = self.normalize_positions(self.targets[idx])
         
         sample = {
-            'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
+            # agent masks
             'obs_mask': self.obs_mask[idx],         # (n_history, MAX_OBSTACLES)
-            # normalized versions
+            'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
+            # raw ego-centric poses
+            'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
+            'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
+            # normalized ego-centric poses
             "obs_pose": norm_obs_pose,             # normalized xyz
             "targets": norm_targets,               # normalized xyz
-            'camera': camera_seq,                   # list of n_history tensors
-            'lidar': lidar_seq,                     # list of n_history tensors
-            'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
-            'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
             'idx': idx,                             # scalar
         }
-        if self.bev is not None:
+        if self.use_camera:
+            camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])
+            sample['camera'] = camera_seq,           # list of n_history tensors
+        if self.use_lidar:
+            lidar_seq  = [self.lidar_loader(f).tolist() for f in self.lidar_files[idx]]
+            sample['lidar'] = lidar_seq,             # list of n_history tensors
+        if self.use_bev:
             sample['bev'] = self.bev[idx]            # (n_history, 4, 256, 256)
+        
         return sample
 
     def get_obs_type(self, idx):
@@ -916,7 +936,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     logger.log("Training Complete.")
 
 
-def load_dataset(split_type="standard", batch_size=16):
+def load_dataset(split_type="standard", batch_size=16, use_camera=False, use_lidar=False, use_bev=False):
     print("Loading Dataset...")
         
     
@@ -930,20 +950,20 @@ def load_dataset(split_type="standard", batch_size=16):
     
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
 
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, norm_stats=stats)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
     print(f'Loaded normalized train dataset! {len(tr_dataset)}')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
     tr_dataloader = DataLoader(tr_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate)
@@ -959,7 +979,7 @@ def load_dataset(split_type="standard", batch_size=16):
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -986,6 +1006,12 @@ if __name__ == "__main__":
                                              'object-animal', 'object-child', 'object-construction_worker', 'object-personal_mobility', 'object-police_officer', 'object-stroller', 'object-wheelchair',
                                              'object-debris', 'object-bicycle_rack',
                                              'object-bendy', 'object-ambulance', 'object-police'],)
+    
+    # modalities (always use pose data, but optionally add extra sensor data)
+    parser.add_argument("--camera", action="store_true", help="Use camera data.")
+    parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
+    parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+    
     args = parser.parse_args()
 
     # Optional CUDA debug envs (you can comment these out if you don't want sync execution)
@@ -993,5 +1019,5 @@ if __name__ == "__main__":
     os.environ["TORCH_USE_CUDA_DSA"] = "1"
     
 
-    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size)
+    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size, args.camera, args.lidar, args.bev)
     train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy)
