@@ -29,6 +29,7 @@ class TRM_ACT_NuScenes_Carry:
     steps: torch.Tensor
     halted: torch.Tensor
     current_data: Dict[str, torch.Tensor]
+    prev_loss: torch.Tensor = None # added for Q_head training, default for back-compatability
 
 
 # =========================
@@ -333,6 +334,7 @@ class TRM_ACT_NuScenes(nn.Module):
             steps=torch.zeros((B,), dtype=torch.int32, device=device),
             halted=torch.ones((B,), dtype=torch.bool, device=device),
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            prev_loss=torch.full((B,), float('inf'), dtype=torch.float32, device=device)
         )
 
     def forward(
@@ -343,6 +345,11 @@ class TRM_ACT_NuScenes(nn.Module):
 
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
         new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
+        new_prev_loss = torch.where(
+            carry.halted,
+            torch.full_like(carry.prev_loss, float('inf')),
+            carry.prev_loss,
+        )
 
         new_current_data = {
             k: torch.where(
@@ -386,6 +393,7 @@ class TRM_ACT_NuScenes(nn.Module):
             steps=new_steps,
             halted=halted,
             current_data=new_current_data,
+            prev_loss=new_prev_loss,
         )
         return new_carry, outputs
 
