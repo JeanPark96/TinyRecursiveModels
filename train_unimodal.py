@@ -7,14 +7,14 @@ import sys
 import datetime
 import json
 import importlib
-import models.recursive_reasoning.trm_unimodal as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 
 importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal import (
+from models.recursive_reasoning.trm_unimodal_v2 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
