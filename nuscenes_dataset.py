@@ -161,9 +161,15 @@ class NuScenesDataset(Dataset):
         return sample
 
     def get_obs_type(self, idx):
-        return self.obs_type[idx]           # (n_history, MAX_OBSTACLES)
+        '''
+        idx: scalar or list of indices
+        '''
+        return self.obs_type[idx]           # (MAX_OBSTACLES)
     
     def get_raw_data(self, idx):
+        '''
+        idx: scalar or list of indices
+        '''
         return {
             'ego_pose':self.ego_pose[idx],              # (n_history, 7)
             'raw_obs_pose':self.raw_obs_pose[idx],      # (n_history, MAX_OBSTACLES, 7)
