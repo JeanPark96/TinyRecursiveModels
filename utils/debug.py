@@ -2,66 +2,7 @@ import matplotlib.pyplot as plt
 import torch
 import os
 import random
-
-# plot for only one object in one sample
-def plot_trajectories(hist_traj, hist_mask, pred_traj, target_traj, target_mask, obs_type, title="Trajectories", RUN_NAME="model", filename = "model_default"):
-    """
-    hist_traj: [History, 2]
-    pred_traj: [Future, 2]
-    target_traj: [Future, 2]
-    """
-    alpha=1.0
-
-    hist_mask = hist_mask > 0
-    target_mask = target_mask > 0
-    n_hist, _ = hist_traj.shape
-
-    hist_traj = hist_traj.detach().cpu()
-    pred_traj = pred_traj.detach().cpu()
-    target_traj = target_traj.detach().cpu()
-
-    plt.figure(figsize=(8, 8))
-    plt.title(title)
-    plt.xlabel("X")
-    plt.ylabel("Y")
-
-    # Plot past trajectory with index labels
-    plt.plot(hist_traj[hist_mask, 0], hist_traj[hist_mask, 1], 'go-', alpha=alpha)
-    
-    for i, (x, y) in enumerate(hist_traj[hist_mask]):
-        plt.text(x, y, '  '+str(-n_hist+i), fontsize=9, color='black', alpha=alpha)
-
-    # Plot predicted trajectory with index labels
-    plt.plot(pred_traj[:, 0], pred_traj[:, 1], 'ro--', label=f"Predicted ({obs_type})", alpha=alpha)
-    
-    for i, (x, y) in enumerate(pred_traj):
-        plt.text(x, y, '  '+str(i), fontsize=9, color='black', alpha=alpha)
-
-    # Plot ground truth trajectory with index labels
-    plt.plot(target_traj[target_mask, 0], target_traj[target_mask, 1], 'go--', label=f"Ground Truth ({obs_type})", alpha=alpha)
-
-    for i, (x, y) in enumerate(target_traj[target_mask]):
-        plt.text(x, y, '  '+str(i), fontsize=9, color='black', alpha=alpha)
-
-    # Plot lines between history and future
-    # mask between last history and first future guaranteed to be true (otherwise, sample would not exist)
-    plt.plot([hist_traj[-1, 0], pred_traj[0,0]], # x
-             [hist_traj[-1, 1], pred_traj[0,1]], # y
-             'r--', alpha=alpha)
-    plt.plot([hist_traj[-1, 0], target_traj[0,0]], # x
-             [hist_traj[-1, 1], target_traj[0,1]], # y
-             'g--', alpha=alpha)
-
-    plt.legend()
-    plt.axis('equal')
-    plt.grid(True)
-    save_path = f'plot_figures/{RUN_NAME}/{filename}.png'
-   
-    os.makedirs(f"plot_figures/{RUN_NAME}", exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Plot saved to: {save_path}")
-
-    #plt.show()
+import numpy as np
 
 def select_debug_batch(dataloader, seed=None):
     """
@@ -82,10 +23,92 @@ def select_debug_batch(dataloader, seed=None):
     debug_batch = next(iter(dataloader))
     return debug_batch, 0
 
-def plot_debug_batch(train_state, dataset, batch, device, epoch, run_name, out_slice):
+# plot for only one object in one sample
+def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_masks, obs_types, title="Trajectories", RUN_NAME="model", filename = "model_default"):
+    """
+    hist_traj: [History, AgentsToPlot, 2]
+    pred_traj: [AgentsToPlot, Future, 2]
+    target_traj: [Future, AgentsToPlot, 2]
+    """
+    alpha=1.0
+    off='  '
+
+    hist_masks = hist_masks > 0
+    target_masks = target_masks > 0
+    n_hist, n_agents, _ = hist_traj.shape
+
+    hist_traj = hist_traj.detach().cpu()
+    pred_traj = pred_traj.detach().cpu()
+    target_traj = target_traj.detach().cpu()
+
+    plt.figure(figsize=(8, 8))
+    plt.title(title)
+    plt.xlabel("X")
+    plt.ylabel("Y")
+
+    # Plot ego
+    plt.plot(0, 0, 'k*', alpha=alpha, label='ego')
+    
+    for j, a in enumerate(range(n_agents)):
+        obs_type = obs_types[a]
+        hist_mask = hist_masks[:,a]
+        target_mask = target_masks[:,a]
+
+        if j > 0:
+            label=None
+
+        # Plot past trajectory with index labels
+        if j == 0:
+            label='History'
+        plt.plot(hist_traj[hist_mask, a, 0], hist_traj[hist_mask, a, 1], 'b.-', alpha=alpha, label=label)
+        
+        for i, (x, y) in enumerate(hist_traj[hist_mask, a]):
+            lbl = off+str(-n_hist+i)
+            if i == 0: lbl += f' ({obs_type})'
+            plt.text(x, y, lbl, fontsize=9, color='black', alpha=alpha)
+
+        # Plot predicted trajectory with index labels
+        if j == 0:
+            label='Predicted'
+        plt.plot(pred_traj[a, :, 0], pred_traj[a, :, 1], 'r.--', label=label, alpha=alpha)
+        
+        for i, (x, y) in enumerate(pred_traj[a]):
+            plt.text(x, y, off+str(i), fontsize=9, color='black', alpha=alpha)
+
+        # Plot ground truth trajectory with index labels
+        if j == 0:
+            label='Ground Truth'
+        plt.plot(target_traj[target_mask, a, 0], target_traj[target_mask, a, 1], 'g.--', label=label, alpha=alpha)
+
+        for i, (x, y) in enumerate(target_traj[target_mask, a]):
+            plt.text(x, y, off+str(i), fontsize=9, color='black', alpha=alpha)
+
+        # Plot lines between history and future
+        # mask between last history and first future guaranteed to be true (otherwise, sample would not exist)
+        plt.plot([hist_traj[-1, a, 0], pred_traj[a, 0, 0]], # x
+                [hist_traj[-1, a, 1], pred_traj[a, 0, 1]], # y
+                'r--', alpha=alpha)
+        plt.plot([hist_traj[-1, a, 0], target_traj[0, a, 0]], # x
+                [hist_traj[-1, a, 1], target_traj[0, a, 1]], # y
+                'g--', alpha=alpha)
+
+    plt.legend()
+    plt.axis('equal')
+    plt.grid(True)
+    save_path = f'plot_figures/{RUN_NAME}/{filename}.png'
+
+    os.makedirs(f"plot_figures/{RUN_NAME}", exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"Plot saved to: {save_path}")
+
+    #plt.show()
+
+def plot_debug_batch(train_state, dataset, batch, device, epoch, run_name, out_slice, together=True):
     """
     Run the model on a fixed batch and plot the first few agents' trajectories.
     Called before training/resume (with the current model state) and after each epoch.
+
+    together: plot all agents on top of each other if true
     """
     train_state.model.eval()
     with torch.no_grad():
@@ -130,14 +153,14 @@ def plot_debug_batch(train_state, dataset, batch, device, epoch, run_name, out_s
         rdm_agents = random.sample(range(A), max_agents_to_plot)
         rdm_samples = random.sample(range(B), max_samples_to_plot)
         
-        for s in rdm_samples:
-            for i in rdm_agents:
-                hist_xy = obs_pose[s, :, i, :2].detach().cpu()
-                hist_mask_cpu = obs_mask[s, :, i].detach().cpu()
-                gt_xy = targets[s, :, i, :2].detach().cpu()
-                targets_mask_cpu = targets_mask[s, :, i].detach().cpu()
-                pred_xy = pred[s, i, :, :2].detach().cpu()
-                obs_type = obs_types[s, i]
+        if together:
+            for s in rdm_samples:
+                hist_xy = obs_pose[s, :, rdm_agents, :2].detach().cpu()
+                hist_mask_cpu = obs_mask[s, :, rdm_agents].detach().cpu()
+                gt_xy = targets[s, :, rdm_agents, :2].detach().cpu()
+                targets_mask_cpu = targets_mask[s, :, rdm_agents].detach().cpu()
+                pred_xy = pred[s, rdm_agents, :, :2].detach().cpu()
+                types = obs_types[s, rdm_agents]
 
                 plot_trajectories(
                     hist_xy,
@@ -145,8 +168,29 @@ def plot_debug_batch(train_state, dataset, batch, device, epoch, run_name, out_s
                     pred_xy,
                     gt_xy,
                     targets_mask_cpu,
-                    obs_type=obs_type,
-                    title=f"[Debug] Agent {i} @ epoch {epoch} sample {s}",
+                    obs_types=types,
+                    title=f"[Debug] epoch {epoch} sample {s}",
                     RUN_NAME=run_name,
-                    filename=f"{run_name}_debug_epoch{epoch}_sample{s}_agent{i}",
+                    filename=f"{run_name}_debug_epoch{epoch}_sample{s}",
                 )
+        else:
+            for s in rdm_samples:
+                for a in rdm_agents:
+                    hist_xy = obs_pose[s, :, a, :2].detach().cpu().unsqueeze(1)
+                    hist_mask_cpu = obs_mask[s, :, a].detach().cpu().unsqueeze(1)
+                    gt_xy = targets[s, :, a, :2].detach().cpu().unsqueeze(1)
+                    targets_mask_cpu = targets_mask[s, :, a].detach().cpu().unsqueeze(1)
+                    pred_xy = pred[s, a, :, :2].detach().cpu().unsqueeze(0)
+                    types = np.expand_dims(np.array(obs_types[s, a]), 0)
+
+                    plot_trajectories(
+                        hist_xy,
+                        hist_mask_cpu,
+                        pred_xy,
+                        gt_xy,
+                        targets_mask_cpu,
+                        obs_types=types,
+                        title=f"[Debug] agent {a} @ epoch {epoch} sample {s}",
+                        RUN_NAME=run_name,
+                        filename=f"{run_name}_debug_epoch{epoch}_sample{s}_agent{a}",
+                    )
