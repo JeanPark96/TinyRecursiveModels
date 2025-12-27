@@ -1,7 +1,6 @@
 import matplotlib.pyplot as plt
 import torch
 import os
-import random
 import numpy as np
 
 def select_debug_batch(dataloader, seed=None):
@@ -22,14 +21,32 @@ def select_debug_batch(dataloader, seed=None):
     #     debug_batch = next(it)
     debug_batch = next(iter(dataloader))
 
-    B, _, A, _ = debug_batch['targets'].shape
-    max_agents_to_plot = min(4, A)
-    max_samples_to_plot = min(5, B)
+    mask = debug_batch['obs_mask']
+    goal_num_agents = 4
+    goal_num_samples = 5
 
-    rdm_agents = random.sample(range(A), max_agents_to_plot)
-    rdm_samples = random.sample(range(B), max_samples_to_plot)
+    # choose only indices with non-null agent slots (history mask is not completely zero)
+    valid = mask.any(axis=1)    # (B, A) bool
 
-    return debug_batch, 0, rdm_agents, rdm_samples
+    valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
+    assert len(valid_batches) > 0
+    valid_batch_idxs = np.random.choice(
+        valid_batches,
+        size=min(goal_num_samples, len(valid_batches)),
+        replace=False
+    )
+
+    valid_agent_idxs = {}
+    for b in valid_batch_idxs:
+        valid_agents = np.where(valid[b])[0]
+        assert len(valid_agents) > 0
+        valid_agent_idxs[b] = np.random.choice(
+            valid_agents,
+            size=min(goal_num_agents, len(valid_agents)),
+            replace=False
+        )
+
+    return debug_batch, 0, valid_agent_idxs, valid_batch_idxs
 
 # plot for only one object in one sample
 def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_masks, obs_types, title="Trajectories", RUN_NAME="model", filename = "model_default"):
@@ -91,14 +108,14 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
         for i, (x, y) in enumerate(target_traj[target_mask, a]):
             plt.text(x, y, off+str(i), fontsize=9, color='black', alpha=alpha)
 
-        # Plot lines between history and future
-        # mask between last history and first future guaranteed to be true (otherwise, sample would not exist)
-        plt.plot([hist_traj[-1, a, 0], pred_traj[a, 0, 0]], # x
-                [hist_traj[-1, a, 1], pred_traj[a, 0, 1]], # y
-                'r--', alpha=alpha)
-        plt.plot([hist_traj[-1, a, 0], target_traj[0, a, 0]], # x
-                [hist_traj[-1, a, 1], target_traj[0, a, 1]], # y
-                'g--', alpha=alpha)
+        # Plot lines between history and future if obstacle is present in future
+        if torch.sum(target_mask) > 0:
+            plt.plot([hist_traj[-1, a, 0], pred_traj[a, 0, 0]], # x
+                    [hist_traj[-1, a, 1], pred_traj[a, 0, 1]], # y
+                    'r--', alpha=alpha)
+            plt.plot([hist_traj[-1, a, 0], target_traj[0, a, 0]], # x
+                    [hist_traj[-1, a, 1], target_traj[0, a, 1]], # y
+                    'g--', alpha=alpha)
 
     plt.legend()
     plt.axis('equal')
@@ -156,12 +173,12 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
         
         if together:
             for s in rdm_samples:
-                hist_xy = obs_pose[s, :, rdm_agents, :2].detach().cpu()
-                hist_mask_cpu = obs_mask[s, :, rdm_agents].detach().cpu()
-                gt_xy = targets[s, :, rdm_agents, :2].detach().cpu()
-                targets_mask_cpu = targets_mask[s, :, rdm_agents].detach().cpu()
-                pred_xy = pred[s, rdm_agents, :, :2].detach().cpu()
-                types = obs_types[s, rdm_agents]
+                hist_xy = obs_pose[s, :, rdm_agents[s], :2].detach().cpu()
+                hist_mask_cpu = obs_mask[s, :, rdm_agents[s]].detach().cpu()
+                gt_xy = targets[s, :, rdm_agents[s], :2].detach().cpu()
+                targets_mask_cpu = targets_mask[s, :, rdm_agents[s]].detach().cpu()
+                pred_xy = pred[s, rdm_agents[s], :, :2].detach().cpu()
+                types = obs_types[s, rdm_agents[s]]
 
                 plot_trajectories(
                     hist_xy,
@@ -176,7 +193,7 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                 )
         else:
             for s in rdm_samples:
-                for a in rdm_agents:
+                for a in rdm_agents[s]:
                     hist_xy = obs_pose[s, :, a, :2].detach().cpu().unsqueeze(1)
                     hist_mask_cpu = obs_mask[s, :, a].detach().cpu().unsqueeze(1)
                     gt_xy = targets[s, :, a, :2].detach().cpu().unsqueeze(1)
