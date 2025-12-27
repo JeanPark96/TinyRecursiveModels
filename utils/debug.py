@@ -21,7 +21,15 @@ def select_debug_batch(dataloader, seed=None):
     # for _ in range(debug_idx + 1):
     #     debug_batch = next(it)
     debug_batch = next(iter(dataloader))
-    return debug_batch, 0
+
+    B, _, A, _ = debug_batch['targets'].shape
+    max_agents_to_plot = min(4, A)
+    max_samples_to_plot = min(5, B)
+
+    rdm_agents = random.sample(range(A), max_agents_to_plot)
+    rdm_samples = random.sample(range(B), max_samples_to_plot)
+
+    return debug_batch, 0, rdm_agents, rdm_samples
 
 # plot for only one object in one sample
 def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_masks, obs_types, title="Trajectories", RUN_NAME="model", filename = "model_default"):
@@ -103,7 +111,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
 
     #plt.show()
 
-def plot_debug_batch(train_state, dataset, batch, device, epoch, run_name, out_slice, together=True):
+def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, device, epoch, run_name, out_slice, together=True):
     """
     Run the model on a fixed batch and plot the first few agents' trajectories.
     Called before training/resume (with the current model state) and after each epoch.
@@ -145,13 +153,6 @@ def plot_debug_batch(train_state, dataset, batch, device, epoch, run_name, out_s
                 break
 
         pred = outputs["pred"]
-
-        B, A, H, _ = pred.shape
-        max_agents_to_plot = min(4, A)
-        max_samples_to_plot = min(5, B)
-
-        rdm_agents = random.sample(range(A), max_agents_to_plot)
-        rdm_samples = random.sample(range(B), max_samples_to_plot)
         
         if together:
             for s in rdm_samples:

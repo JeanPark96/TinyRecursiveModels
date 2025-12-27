@@ -271,7 +271,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         optimizer.load_state_dict(ckpt["optimizer"])
 
     # --- Choose a debug batch for qualitative comparison across epochs ---
-    debug_batch, debug_idx = select_debug_batch(val_dataloader, seed=args.seed)
+    debug_batch, debug_idx, rdm_agents, rdm_samples = select_debug_batch(val_dataloader, seed=args.seed)
     logger.log(f"Selected validation batch index {debug_idx} as debug batch for plotting.")
 
     # --- Choose a debug batch for ood for qualitative comparison across epochs ---
@@ -295,6 +295,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         train_state,
         val_dataset,
         debug_batch,
+        rdm_agents,
+        rdm_samples,
         device,
         epoch=start_epoch,
         run_name=RUN_NAME,
@@ -514,6 +516,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     train_state,
                     val_dataset,
                     debug_batch,
+                    rdm_agents,
+                    rdm_samples,
                     device,
                     epoch=epoch+1,
                     run_name=RUN_NAME,
