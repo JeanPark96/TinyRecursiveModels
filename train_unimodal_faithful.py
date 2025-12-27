@@ -293,6 +293,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     # --- Plot BEFORE training/resume (using current model state) ---
     plot_debug_batch(
         train_state,
+        val_dataset,
         debug_batch,
         device,
         epoch=start_epoch,
@@ -319,7 +320,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
-            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
+            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]        
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -484,6 +485,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             # --- Plot debug batch AFTER this epoch ---
             plot_debug_batch(
                 train_state,
+                val_dataset,
                 debug_batch,
                 device,
                 epoch=epoch+1,
