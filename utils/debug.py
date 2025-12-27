@@ -60,7 +60,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
 
     hist_masks = hist_masks > 0
     target_masks = target_masks > 0
-    n_hist, n_agents, _ = hist_traj.shape
+    _, n_agents, _ = hist_traj.shape
 
     hist_traj = hist_traj.detach().cpu()
     pred_traj = pred_traj.detach().cpu()
@@ -88,7 +88,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
         plt.plot(hist_traj[hist_mask, a, 0], hist_traj[hist_mask, a, 1], 'b.-', alpha=alpha, label=label)
         
         for i, (x, y) in enumerate(hist_traj[hist_mask, a]):
-            lbl = off+str(-n_hist+i)
+            lbl = off+str(-torch.sum(hist_mask).numpy()+i+1)
             if i == 0: lbl += f' ({obs_type})'
             plt.text(x, y, lbl, fontsize=9, color='black', alpha=alpha)
 
@@ -98,7 +98,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
         plt.plot(pred_traj[a, :, 0], pred_traj[a, :, 1], 'r.--', label=label, alpha=alpha)
         
         for i, (x, y) in enumerate(pred_traj[a]):
-            plt.text(x, y, off+str(i), fontsize=9, color='black', alpha=alpha)
+            plt.text(x, y, off+str(i+1), fontsize=9, color='black', alpha=alpha)
 
         # Plot ground truth trajectory with index labels
         if j == 0:
@@ -106,7 +106,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
         plt.plot(target_traj[target_mask, a, 0], target_traj[target_mask, a, 1], 'g.--', label=label, alpha=alpha)
 
         for i, (x, y) in enumerate(target_traj[target_mask, a]):
-            plt.text(x, y, off+str(i), fontsize=9, color='black', alpha=alpha)
+            plt.text(x, y, off+str(i+1), fontsize=9, color='black', alpha=alpha)
 
         # Plot lines between history and future if obstacle is present in future
         if torch.sum(target_mask) > 0:
