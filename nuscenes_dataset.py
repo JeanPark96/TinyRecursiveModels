@@ -133,6 +133,7 @@ class NuScenesDataset(Dataset):
             'idx': idx,                             # scalar
         }
 
+        # multiple agents
         # # Normalized pose (xyz only)
         # norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
         # norm_targets  = self.normalize_positions(self.targets[idx])
