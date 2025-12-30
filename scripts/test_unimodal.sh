@@ -1,0 +1,1 @@
+python train_unimodal_faithful.py --run_name plots --halt_max_steps 16 --gpu_id 2 --epochs 3000 --lr 1e-5 --config_batch_size 32

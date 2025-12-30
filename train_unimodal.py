@@ -398,7 +398,7 @@ def run_act_steps(
     outputs = None
     losses = []
 
-    for _ in range(model.config.halt_max_steps):
+    for s in range(model.config.halt_max_steps):
         carry, outputs = model(carry, model_input)
 
         if targets is not None and targets_mask is not None:
@@ -415,6 +415,15 @@ def run_act_steps(
                 optimizer.step()
 
         if early_stop and carry.halted.all():
+            if s < model.config.halt_max_steps-1:
+                print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!HALTED EARLY!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+            # this may loop excessively
+            # carry.halted.all will only be true once every sample in the batch get a raised halt flag
+            # this happens when the q head raises the flat or you reach max_halt_steps
+            # in the original code, new data from the next batch is then filled in
+            # but in this case, we reuse the same batch, and recalculate the halt flag, which could now be reset again
+            # the chances with all this resetting of the carry.halted.all() = True is now pretty low
+
             break
 
     loss_avg = None
