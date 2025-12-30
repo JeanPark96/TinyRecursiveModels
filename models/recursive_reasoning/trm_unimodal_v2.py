@@ -188,6 +188,12 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             batch_first=True,
             dtype=self.forward_dtype
         )
+
+        #Layer Normalization
+        self.norm_out = nn.LayerNorm(self.config.hidden_size)
+
+        # Dropout
+        self.dropout = nn.Dropout(0.1)
         
         # Projection to output space
         self.output_proj = CastedLinear(self.config.hidden_size, self.config.out_dim, bias=True)
@@ -319,6 +325,17 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
 
+        # mask is required
+        obs_mask = batch["obs_mask"]  # [B, T_obs, A]
+        mask_flat = obs_mask.permute(0, 2, 1).contiguous().view(B * A, T_obs)  # [B * A, T_obs]
+        
+        key_padding_mask = (mask_flat == 0)
+
+        all_masked = key_padding_mask.all(dim=-1) # [B*A]
+        if all_masked.any():
+            # Force the first token to be valid for these dummy agents
+            key_padding_mask[all_masked, 0] = False
+
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
         agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
 
@@ -334,11 +351,16 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         attn_out, _ = self.decoder_attn(
             query=queries,
             key=history_kv,
-            value=history_kv
+            value=history_kv, 
+            key_padding_mask=key_padding_mask
         )
 
+        x = self.norm_out(queries + attn_out)
+
+        x = self.dropout(x)
+
         # 5. Project to output dim: [B*A, T_pred, out_dim]
-        pred_flat = self.output_proj(attn_out)
+        pred_flat = self.output_proj(x)
 
         # 6. Reshape back to batch format: [B, A, T_pred, out_dim]
         pred = pred_flat.view(B, A, T_pred, self.config.out_dim)
