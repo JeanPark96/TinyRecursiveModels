@@ -49,7 +49,7 @@ from models.recursive_reasoning.trm_unimodal_v2 import (
 )
 
 SAMPLE_FREQ = 2
-max_obstacles = 1 #30
+max_obstacles = 30
 n_history = 2*SAMPLE_FREQ # current time inclusive
 n_horizon = 2*SAMPLE_FREQ
 
@@ -271,12 +271,12 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         optimizer.load_state_dict(ckpt["optimizer"])
 
     # --- Choose a debug batch for qualitative comparison across epochs ---
-    debug_batch, debug_idx, rdm_agents, rdm_samples = select_debug_batch(val_dataloader, seed=args.seed)
+    debug_batch, debug_idx, rdm_agents, rdm_samples = select_debug_batch(val_dataloader, seed=args.seed)    
     logger.log(f"Selected validation batch index {debug_idx} as debug batch for plotting.")
 
     # --- Choose a debug batch for ood for qualitative comparison across epochs ---
     if ood_dataloader is not None:
-        ood_debug_batch, ood_debug_idx = select_debug_batch(ood_dataloader, seed=args.seed)
+        ood_debug_batch, ood_debug_idx, ood_rdm_agents, ood_rdm_samples = select_debug_batch(ood_dataloader, seed=args.seed)
         logger.log(f"Selected ood batch index {debug_idx} as debug batch for plotting.")
 
     # Train state
@@ -299,7 +299,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         rdm_samples,
         device,
         epoch=start_epoch,
-        run_name=RUN_NAME,
+        run_name=f'{RUN_NAME}_val',
         out_slice=config_dict["out_slice"]
     )
 
@@ -511,7 +511,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     f"New best model (val_loss={best_val_loss:.4f}); saved to {best_ckpt_path}"
                 )
 
-                # --- Plot debug batch AFTER this epoch if val loss improving---
+                # --- Plot debug batch AFTER this epoch if val loss improving ---
                 plot_debug_batch(
                     train_state,
                     val_dataset,
@@ -520,11 +520,22 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     rdm_samples,
                     device,
                     epoch=epoch+1,
-                    run_name=RUN_NAME,
+                    run_name=f'{RUN_NAME}_val',
                     out_slice=config_dict["out_slice"],
                 )
 
-        #TODO: ADD OOD EVAL
+                plot_debug_batch(
+                    train_state,
+                    ood_dataset,
+                    ood_debug_batch,
+                    ood_rdm_agents,
+                    ood_rdm_samples,
+                    device,
+                    epoch=epoch+1,
+                    run_name=f'{RUN_NAME}_ood',
+                    out_slice=config_dict["out_slice"],
+                )
+
 
         logger.log("-" * 30)
 
@@ -575,7 +586,7 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
     else:

@@ -3,30 +3,11 @@ import torch
 import os
 import numpy as np
 
-def select_debug_batch(dataloader, seed=None):
-    """
-    Choose a random batch index from the dataloader and return that batch.
-    Used for plotting before training and after each epoch so we can track
-    how predictions evolve on the same batch over time.
-    """
-    # if seed is not None:
-    #     rng = np.random.RandomState(seed)
-    #     debug_idx = rng.randint(len(dataloader))
-    # else:
-    #     debug_idx = random.randint(0, len(dataloader) - 1)
-
-    # it = iter(dataloader)
-    # debug_batch = None
-    # for _ in range(debug_idx + 1):
-    #     debug_batch = next(it)
-    debug_batch = next(iter(dataloader))
-
-    mask = debug_batch['obs_mask']
-    goal_num_agents = 4
-    goal_num_samples = 5
-
-    # choose only indices with non-null agent slots (history mask is not completely zero)
-    valid = mask.any(axis=1)    # (B, A) bool
+def get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples):
+    '''
+    From mask, choose only indices with non-null agent slots (history mask is not completely zero)
+    '''
+    valid = obs_mask.detach().cpu().any(axis=1)    # (B, A) bool
 
     valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
     assert len(valid_batches) > 0
@@ -46,6 +27,33 @@ def select_debug_batch(dataloader, seed=None):
             replace=False
         )
 
+    return valid_batch_idxs, valid_agent_idxs
+
+def select_debug_batch(dataloader, seed=None):
+    """
+    Choose a random batch index from the dataloader and return that batch.
+    Used for plotting before training and after each epoch so we can track
+    how predictions evolve on the same batch over time.
+    """
+    # if seed is not None:
+    #     rng = np.random.RandomState(seed)
+    #     debug_idx = rng.randint(len(dataloader))
+    # else:
+    #     debug_idx = random.randint(0, len(dataloader) - 1)
+
+    # it = iter(dataloader)
+    # debug_batch = None
+    # for _ in range(debug_idx + 1):
+    #     debug_batch = next(it)
+    debug_batch = next(iter(dataloader))
+
+    obs_mask = debug_batch['obs_mask']
+    goal_num_agents = 4
+    goal_num_samples = 5
+
+    # choose only indices with non-null agent slots (history mask is not completely zero)
+    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples)
+
     return debug_batch, 0, valid_agent_idxs, valid_batch_idxs
 
 # plot for only one object in one sample
@@ -55,7 +63,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
     pred_traj: [AgentsToPlot, Future, 2]
     target_traj: [Future, AgentsToPlot, 2]
     """
-    alpha=1.0
+    alpha=0.8
     off='  '
 
     hist_masks = hist_masks > 0
@@ -124,10 +132,12 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
 
     os.makedirs(f"plot_figures/{RUN_NAME}", exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    print(f"Plot saved to: {save_path}")
+    # print(f"Plot saved to: {save_path}")
+    plt.close()
 
     #plt.show()
 
+@torch.no_grad()
 def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, device, epoch, run_name, out_slice, together=True):
     """
     Run the model on a fixed batch and plot the first few agents' trajectories.
@@ -136,49 +146,70 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
     together: plot all agents on top of each other if true
     """
     train_state.model.eval()
-    with torch.no_grad():
-        obs_pose = batch["obs_pose"].to(device)
-        obs_mask = batch["obs_mask"].to(device)
-        targets = batch["targets"].to(device)
-        targets_mask = batch.get("targets_mask", None)
-        if targets_mask is None:
-            targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
-        else:
-            targets_mask = targets_mask.to(device)
-        sample_idx = batch["idx"]                            # [B]
-        obs_types = dataset.get_obs_type(sample_idx)      # [B, A]    
 
-        model_input = {
-            "obs_pose": obs_pose,
-            "obs_mask": obs_mask,
-            "targets": targets,
-            "targets_mask": targets_mask,
-        }
+    obs_pose = batch["obs_pose"].to(device)
+    obs_mask = batch["obs_mask"].to(device)
+    targets = batch["targets"].to(device)
+    targets_mask = batch.get("targets_mask", None)
+    if targets_mask is None:
+        targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
+    else:
+        targets_mask = targets_mask.to(device)
+    sample_idx = batch["idx"]                            # [B]
+    obs_types = dataset.get_obs_type(sample_idx)      # [B, A]    
 
-        with torch.device("cuda"):
-            carry = train_state.model.initial_carry(model_input)  # type: ignore
+    model_input = {
+        "obs_pose": obs_pose,
+        "obs_mask": obs_mask,
+        "targets": targets,
+        "targets_mask": targets_mask,
+    }
 
-        # Forward
-        inference_steps = 0
-        while True:
-            carry, loss, metrics, outputs, all_finish = train_state.model(
-                carry=carry, batch=model_input, return_keys=["pred"]
+    with torch.device("cuda"):
+        carry = train_state.model.initial_carry(model_input)  # type: ignore
+
+    # Forward
+    inference_steps = 0
+    while True:
+        carry, loss, metrics, outputs, all_finish = train_state.model(
+            carry=carry, batch=model_input, return_keys=["pred"]
+        )
+        inference_steps += 1
+
+        if all_finish:
+            break
+
+    pred = outputs["pred"]
+    
+    if together:
+        for s in rdm_samples:
+            hist_xy = obs_pose[s, :, rdm_agents[s], :2].detach().cpu()
+            hist_mask_cpu = obs_mask[s, :, rdm_agents[s]].detach().cpu()
+            gt_xy = targets[s, :, rdm_agents[s], :2].detach().cpu()
+            targets_mask_cpu = targets_mask[s, :, rdm_agents[s]].detach().cpu()
+            pred_xy = pred[s, rdm_agents[s], :, :2].detach().cpu()
+            types = obs_types[s, rdm_agents[s]]
+
+            plot_trajectories(
+                hist_xy,
+                hist_mask_cpu,
+                pred_xy,
+                gt_xy,
+                targets_mask_cpu,
+                obs_types=types,
+                title=f"[Debug] epoch {epoch} sample {s}",
+                RUN_NAME=run_name,
+                filename=f"{run_name}_debug_epoch{epoch}_sample{s}",
             )
-            inference_steps += 1
-
-            if all_finish:
-                break
-
-        pred = outputs["pred"]
-        
-        if together:
-            for s in rdm_samples:
-                hist_xy = obs_pose[s, :, rdm_agents[s], :2].detach().cpu()
-                hist_mask_cpu = obs_mask[s, :, rdm_agents[s]].detach().cpu()
-                gt_xy = targets[s, :, rdm_agents[s], :2].detach().cpu()
-                targets_mask_cpu = targets_mask[s, :, rdm_agents[s]].detach().cpu()
-                pred_xy = pred[s, rdm_agents[s], :, :2].detach().cpu()
-                types = obs_types[s, rdm_agents[s]]
+    else:
+        for s in rdm_samples:
+            for a in rdm_agents[s]:
+                hist_xy = obs_pose[s, :, a, :2].detach().cpu().unsqueeze(1)
+                hist_mask_cpu = obs_mask[s, :, a].detach().cpu().unsqueeze(1)
+                gt_xy = targets[s, :, a, :2].detach().cpu().unsqueeze(1)
+                targets_mask_cpu = targets_mask[s, :, a].detach().cpu().unsqueeze(1)
+                pred_xy = pred[s, a, :, :2].detach().cpu().unsqueeze(0)
+                types = np.expand_dims(np.array(obs_types[s, a]), 0)
 
                 plot_trajectories(
                     hist_xy,
@@ -187,28 +218,73 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                     gt_xy,
                     targets_mask_cpu,
                     obs_types=types,
-                    title=f"[Debug] epoch {epoch} sample {s}",
+                    title=f"[Debug] agent {a} @ epoch {epoch} sample {s}",
                     RUN_NAME=run_name,
-                    filename=f"{run_name}_debug_epoch{epoch}_sample{s}",
+                    filename=f"{run_name}_debug_epoch{epoch}_sample{s}_agent{a}",
                 )
-        else:
-            for s in rdm_samples:
-                for a in rdm_agents[s]:
-                    hist_xy = obs_pose[s, :, a, :2].detach().cpu().unsqueeze(1)
-                    hist_mask_cpu = obs_mask[s, :, a].detach().cpu().unsqueeze(1)
-                    gt_xy = targets[s, :, a, :2].detach().cpu().unsqueeze(1)
-                    targets_mask_cpu = targets_mask[s, :, a].detach().cpu().unsqueeze(1)
-                    pred_xy = pred[s, a, :, :2].detach().cpu().unsqueeze(0)
-                    types = np.expand_dims(np.array(obs_types[s, a]), 0)
 
-                    plot_trajectories(
-                        hist_xy,
-                        hist_mask_cpu,
-                        pred_xy,
-                        gt_xy,
-                        targets_mask_cpu,
-                        obs_types=types,
-                        title=f"[Debug] agent {a} @ epoch {epoch} sample {s}",
-                        RUN_NAME=run_name,
-                        filename=f"{run_name}_debug_epoch{epoch}_sample{s}_agent{a}",
-                    )
+@torch.no_grad()
+def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_slice, goal_num_agents=8, goal_num_samples=5, together=True):
+    """
+    together: plot all agents on top of each other if true
+    """
+    obs_pose = batch["obs_pose"].to(device)
+    obs_mask = batch["obs_mask"].to(device)
+    targets = batch["targets"].to(device)
+    targets_mask = batch.get("targets_mask", None)
+    if targets_mask is None:
+        targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
+    else:
+        targets_mask = targets_mask.to(device)
+    sample_idx = batch["idx"]                            # [B]
+    obs_types = dataset.get_obs_type(sample_idx)      # [B, A]    
+    pred = outputs["pred"]
+    
+    B, _, A, _ = obs_pose.shape
+    goal_num_agents = min(goal_num_agents, A)
+    goal_num_samples = min(goal_num_samples, B)
+
+    # choose only indices with non-null agent slots (history mask is not completely zero)
+    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples)
+
+    if together:
+        for s in valid_batch_idxs:
+            hist_xy = obs_pose[s, :, valid_agent_idxs[s], :2].detach().cpu()
+            hist_mask_cpu = obs_mask[s, :, valid_agent_idxs[s]].detach().cpu()
+            gt_xy = targets[s, :, valid_agent_idxs[s], :2].detach().cpu()
+            targets_mask_cpu = targets_mask[s, :, valid_agent_idxs[s]].detach().cpu()
+            pred_xy = pred[s, valid_agent_idxs[s], :, :2].detach().cpu()
+            types = obs_types[s, valid_agent_idxs[s]]
+
+            plot_trajectories(
+                hist_xy,
+                hist_mask_cpu,
+                pred_xy,
+                gt_xy,
+                targets_mask_cpu,
+                obs_types=types,
+                title=f"[Test] batch {batch_num} sample {s}",
+                RUN_NAME=run_name,
+                filename=f"{run_name}_test_batch_{batch_num}_sample{s}",
+            )
+    else:
+        for s in valid_batch_idxs:
+            for a in valid_agent_idxs[s]:
+                hist_xy = obs_pose[s, :, a, :2].detach().cpu().unsqueeze(1)
+                hist_mask_cpu = obs_mask[s, :, a].detach().cpu().unsqueeze(1)
+                gt_xy = targets[s, :, a, :2].detach().cpu().unsqueeze(1)
+                targets_mask_cpu = targets_mask[s, :, a].detach().cpu().unsqueeze(1)
+                pred_xy = pred[s, a, :, :2].detach().cpu().unsqueeze(0)
+                types = np.expand_dims(np.array(obs_types[s, a]), 0)
+
+                plot_trajectories(
+                    hist_xy,
+                    hist_mask_cpu,
+                    pred_xy,
+                    gt_xy,
+                    targets_mask_cpu,
+                    obs_types=types,
+                    title=f"[Test] agent {a} @ batch {batch_num} sample {s}",
+                    RUN_NAME=run_name,
+                    filename=f"{run_name}_test_batch{batch_num}_sample{s}_agent{a}",
+                )

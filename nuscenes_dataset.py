@@ -117,39 +117,40 @@ class NuScenesDataset(Dataset):
         return torch.from_numpy(points)
 
     def __getitem__(self, idx):
-        # single agent only
-        norm_obs_pose = self.normalize_positions(self.obs_pose[idx,:,0,:])
-        norm_targets  = self.normalize_positions(self.targets[idx,:,0,:])
+        # # single agent only
+        # norm_obs_pose = self.normalize_positions(self.obs_pose[idx,:,0,:])
+        # norm_targets  = self.normalize_positions(self.targets[idx,:,0,:])
+        # sample = {
+        #     # agent masks
+        #     'obs_mask': self.obs_mask[idx,:,0].unsqueeze(1),         # (n_history,1)
+        #     'targets_mask': self.targets_mask[idx,:,0].unsqueeze(1), # (n_horizon,1) 
+        #     # raw ego-centric poses
+        #     'org_obs_pose': self.obs_pose[idx,:,0,:].unsqueeze(1),         # (n_history, 1, 7)
+        #     'org_targets': self.targets[idx,:,0,:].unsqueeze(1),           # (n_horizon, 1, 7)
+        #     # normalized ego-centric poses
+        #     "obs_pose": norm_obs_pose.unsqueeze(1),             # normalized xyz
+        #     "targets": norm_targets.unsqueeze(1),               # normalized xyz
+        #     'idx': idx,                             # scalar
+        # }
+
+        # multiple agents
+        # Normalized pose (xyz only)
+        norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
+        norm_targets  = self.normalize_positions(self.targets[idx])
+        
         sample = {
             # agent masks
-            'obs_mask': self.obs_mask[idx,:,0].unsqueeze(1),         # (n_history,1)
-            'targets_mask': self.targets_mask[idx,:,0].unsqueeze(1), # (n_horizon,1) 
+            'obs_mask': self.obs_mask[idx],         # (n_history, MAX_OBSTACLES)
+            'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
             # raw ego-centric poses
-            'org_obs_pose': self.obs_pose[idx,:,0,:].unsqueeze(1),         # (n_history, 1, 7)
-            'org_targets': self.targets[idx,:,0,:].unsqueeze(1),           # (n_horizon, 1, 7)
+            'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
+            'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
             # normalized ego-centric poses
-            "obs_pose": norm_obs_pose.unsqueeze(1),             # normalized xyz
-            "targets": norm_targets.unsqueeze(1),               # normalized xyz
+            "obs_pose": norm_obs_pose,             # normalized xyz
+            "targets": norm_targets,               # normalized xyz
             'idx': idx,                             # scalar
         }
 
-        # multiple agents
-        # # Normalized pose (xyz only)
-        # norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
-        # norm_targets  = self.normalize_positions(self.targets[idx])
-        
-        # sample = {
-        #     # agent masks
-        #     'obs_mask': self.obs_mask[idx],         # (n_history, MAX_OBSTACLES)
-        #     'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
-        #     # raw ego-centric poses
-        #     'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
-        #     'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
-        #     # normalized ego-centric poses
-        #     "obs_pose": norm_obs_pose,             # normalized xyz
-        #     "targets": norm_targets,               # normalized xyz
-        #     'idx': idx,                             # scalar
-        # }
         if self.use_camera:
             camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])          
             sample.update(camera=camera_seq)        # list of n_history tensors
