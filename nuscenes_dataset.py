@@ -73,7 +73,7 @@ class NuScenesDataset(Dataset):
         if self.use_lidar: self.lidar_files = data['lidar']            # filepaths: (n_examples, n_history)
         if self.use_bev:
             if 'bev' in data: # necessary for old versions where bev is not in data
-                self.bev = data['bev']                                          # None or (n_examples, n_history, 4, 256, 256)
+                self.bev = self.unwrap_optional_array(data['bev'])     # None or (n_examples, n_history, 4, 256, 256)
             else:
                 raise IndexError('Data type bev is not in this dataset.')
 
@@ -97,6 +97,11 @@ class NuScenesDataset(Dataset):
 
     def __len__(self):
         return self.n_samples
+
+    def unwrap_optional_array(self, x):
+        if x.dtype == object and x.shape == () and x.item() is None:
+            return None
+        return x
 
     def camera_loader(self, path):
         # based on pytorch pil_loader: https://docs.pytorch.org/vision/main/_modules/torchvision/datasets/folder.html#ImageFolder
