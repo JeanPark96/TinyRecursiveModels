@@ -9,8 +9,13 @@ def get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples):
     '''
     valid = obs_mask.detach().cpu().any(axis=1)    # (B, A) bool
 
-    valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
-    assert len(valid_batches) > 0
+    valid_batches = []
+    while len(valid_batches) == 0 and goal_num_agents > 0:
+        valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
+        goal_num_agents -= 1
+    if goal_num_agents == 0 and len(valid_batches) == 0:
+        return None, None
+
     valid_batch_idxs = np.random.choice(
         valid_batches,
         size=min(goal_num_samples, len(valid_batches)),
@@ -53,6 +58,7 @@ def select_debug_batch(dataloader, seed=None):
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
     valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples)
+    assert valid_batch_idxs is not None
 
     return debug_batch, 0, valid_agent_idxs, valid_batch_idxs
 
@@ -246,6 +252,8 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
     valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples)
+    if valid_batch_idxs is None:
+        return
 
     if together:
         for s in valid_batch_idxs:

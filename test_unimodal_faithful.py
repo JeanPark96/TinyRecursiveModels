@@ -116,8 +116,11 @@ def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
 
     return ade.item(), fde.item()
 
-def eval(args, test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy):
-    RUN_NAME = f'{args.run_name}_test' 
+def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
+    if ood:
+        RUN_NAME = f'{args.run_name}_ood' 
+    else:
+        RUN_NAME = f'{args.run_name}' 
     LOG_DIR = "logs"
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -160,14 +163,17 @@ def eval(args, test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats
         carry=None
     )
 
-    # Training Loop
-    logger.log("Running Test...")
+    # Testing Loop
+    if ood:
+        logger.log("Running OOD...")
+    else:
+        logger.log("Running Test...")
     train_state.model.eval()
     ade_sum = fde_sum = ade_real_sum = fde_real_sum = loss_sum = 0.0
     n = 0
 
     with torch.no_grad():
-        for b, batch in enumerate(test_dataloader):
+        for b, batch in enumerate(dataloader):
             if b % 10 == 0:
                 print(f'Batch {b}')
 
@@ -204,12 +210,12 @@ def eval(args, test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats
 
             # plot batch
             plot_test_batch(
-                test_dataset,
+                dataset,
                 batch,
                 b,
                 outputs,
                 device,
-                run_name=RUN_NAME,
+                run_name=f'test_{RUN_NAME}',
                 out_slice=config_dict["out_slice"],
             )
 
@@ -255,19 +261,26 @@ def eval(args, test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats
     ave_fde_real = fde_real_sum / max(n, 1)
     ave_loss = loss_sum / max(n, 1)
 
-    logger.log(
-        f"Test Results: "
-        f"Loss: {ave_loss:.4f} | "
-        f"ADE: {ave_ade:.4f} | "
-        f"FDE: {ave_fde:.4f} | "
-        f"Real ADE: {ave_ade_real:.4f} | "
-        f"Real FDE: {ave_fde_real:.4f}"
-    )
-
-    #TODO: ADD OOD EVAL
-
-    # finalize
-    logger.log("Testing Complete.")
+    if ood:
+        logger.log(
+            f"OOD Results: "
+            f"Loss: {ave_loss:.4f} | "
+            f"ADE: {ave_ade:.4f} | "
+            f"FDE: {ave_fde:.4f} | "
+            f"Real ADE: {ave_ade_real:.4f} | "
+            f"Real FDE: {ave_fde_real:.4f}"
+        )
+        logger.log("OOD Complete.")
+    else:
+        logger.log(
+            f"Test Results: "
+            f"Loss: {ave_loss:.4f} | "
+            f"ADE: {ave_ade:.4f} | "
+            f"FDE: {ave_fde:.4f} | "
+            f"Real ADE: {ave_ade_real:.4f} | "
+            f"Real FDE: {ave_fde_real:.4f}"
+        )
+        logger.log("Testing Complete.")
 
 def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12, use_camera=False, use_lidar=False, use_bev=False):
     print("Loading Dataset...")
@@ -298,7 +311,7 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -347,5 +360,6 @@ if __name__ == "__main__":
     # load dataset
     test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size, n_history, n_horizon, args.camera, args.lidar, args.bev)
     
-    # train
-    eval(args, test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy)
+    # test
+    eval(args, test_dataset, test_dataloader, stats, mean_xy, std_xy, ood=False)
+    eval(args, ood_dataset, ood_dataloader, stats, mean_xy, std_xy, ood=True)

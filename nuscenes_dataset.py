@@ -37,7 +37,7 @@ def custom_collate(batch):
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, use_camera=False, use_lidar=False, use_bev=False, norm_stats=True):
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, use_camera=False, use_lidar=False, use_bev=False, norm_stats=True):      
         self.use_camera = use_camera
         self.use_lidar = use_lidar
         self.use_bev = use_bev
@@ -47,27 +47,30 @@ class NuScenesDataset(Dataset):
         
         # load dataset
         data = np.load(data_pth, allow_pickle=True)
+        assert n_horizon <= data['targets_mask'].shape[1]
+        assert n_history <= data['obs_mask'].shape[1]
+        assert max_obstacles <= data['targets_mask'].shape[2]
 
         # pose normalization statistics
         self.norm_stats = norm_stats
 
         # agent masks
-        self.obs_mask = torch.from_numpy(data['obs_mask'])                  # (n_examples, n_history, MAX_OBSTACLES)
-        self.targets_mask = torch.from_numpy(data['targets_mask'])[:, :n_horizon, :]          # (n_examples, n_horizon, MAX_OBSTACLES)
+        self.obs_mask = torch.from_numpy(data['obs_mask'])[:, -n_history:, :max_obstacles].reshape(-1, n_history, max_obstacles)  # (n_examples, n_history, max_obstacles)
+        self.targets_mask = torch.from_numpy(data['targets_mask'])[:, :n_horizon, :max_obstacles].reshape(-1, n_horizon, max_obstacles)  # (n_examples, n_horizon, max_obstacles)
 
         # agent type
-        self.obs_type = data['obs_type' ]                                   # strings: (n_examples, n_history, MAX_OBSTACLES)
+        self.obs_type = data['obs_type'][:, :max_obstacles].reshape(-1, max_obstacles) # strings: (n_examples, max_obstacles)
 
         # ego-centric pose
-        self.obs_pose = torch.from_numpy(data['obs_pose']).float()          # (n_examples, n_history, MAX_OBSTACLES, 7)
-        self.targets = torch.from_numpy(data['targets'])[:, :n_horizon, :].float()            # (n_examples, n_horizon, MAX_OBSTACLES, 7)
+        self.obs_pose = torch.from_numpy(data['obs_pose'])[:, -n_history:, :max_obstacles, :].reshape(-1, n_history, max_obstacles, 7).float() # (n_examples, n_history, max_obstacles, 7)
+        self.targets = torch.from_numpy(data['targets'])[:, :n_horizon, :max_obstacles, :].reshape(-1, n_horizon, max_obstacles, 7).float() # (n_examples, n_horizon, max_obstacles, 7)
         
         # global frame pose
-        self.ego_pose = torch.from_numpy(data['ego_pose']).float()          # (n_examples, n_history, 7)
-        self.raw_obs_pose = torch.from_numpy(data['raw_obs_pose']).float()  # (n_examples, n_history, MAX_OBSTACLES, 7)
-        self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].float()      # (n_examples, n_horizon, 7)
-        self.raw_target = torch.from_numpy(data['raw_target'])[:, :n_horizon, :].float()      # (n_examples, n_horizon, MAX_OBSTACLES, 7)
-        
+        self.ego_pose = torch.from_numpy(data['ego_pose'])[:, -n_history:, :].reshape(-1, n_history, 7).float() # (n_examples, n_history, 7)
+        self.raw_obs_pose = torch.from_numpy(data['raw_obs_pose'])[:, -n_history:, :max_obstacles, :].reshape(-1, n_history, max_obstacles, 7).float() # (n_examples, n_history, max_obstacles, 7)
+        self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].reshape(-1, n_horizon, 7).float() # (n_examples, n_horizon, 7)
+        self.raw_target = torch.from_numpy(data['raw_target'])[:, :n_horizon, :max_obstacles, :].reshape(-1, n_horizon, max_obstacles, 7).float() # (n_examples, n_horizon, max_obstacles, 7)
+
         # optional sensor data
         if self.use_camera: self.camera_files = data['camera']        # filepaths: (n_examples, n_history)
         if self.use_lidar: self.lidar_files = data['lidar']            # filepaths: (n_examples, n_history)
@@ -122,23 +125,6 @@ class NuScenesDataset(Dataset):
         return torch.from_numpy(points)
 
     def __getitem__(self, idx):
-        # # single agent only
-        # norm_obs_pose = self.normalize_positions(self.obs_pose[idx,:,0,:])
-        # norm_targets  = self.normalize_positions(self.targets[idx,:,0,:])
-        # sample = {
-        #     # agent masks
-        #     'obs_mask': self.obs_mask[idx,:,0].unsqueeze(1),         # (n_history,1)
-        #     'targets_mask': self.targets_mask[idx,:,0].unsqueeze(1), # (n_horizon,1) 
-        #     # raw ego-centric poses
-        #     'org_obs_pose': self.obs_pose[idx,:,0,:].unsqueeze(1),         # (n_history, 1, 7)
-        #     'org_targets': self.targets[idx,:,0,:].unsqueeze(1),           # (n_horizon, 1, 7)
-        #     # normalized ego-centric poses
-        #     "obs_pose": norm_obs_pose.unsqueeze(1),             # normalized xyz
-        #     "targets": norm_targets.unsqueeze(1),               # normalized xyz
-        #     'idx': idx,                             # scalar
-        # }
-
-        # multiple agents
         # Normalized pose (xyz only)
         norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
         norm_targets  = self.normalize_positions(self.targets[idx])

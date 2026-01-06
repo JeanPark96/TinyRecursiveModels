@@ -49,11 +49,6 @@ from models.recursive_reasoning.trm_unimodal_v2 import (
 )
 
 SAMPLE_FREQ = 2
-max_obstacles = 30
-n_history = 2*SAMPLE_FREQ # current time inclusive
-n_horizon = 2*SAMPLE_FREQ
-
-print(f"n_history: {n_history}, n_horizon: {n_horizon}")
 
 @dataclass
 class TrainState:
@@ -208,12 +203,12 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
     else:
         # --- Fresh config (for TRM_ACT_NuScenes) ---
-        print("Horizon", n_horizon)
+        print("Horizon", args.n_horizon)
         config_dict = {
             "batch_size": args.config_batch_size,  # logical batch size; dataloader can differ
-            "n_history": n_history,
-            "max_obstacles": max_obstacles,
-            "n_horizon": n_horizon,
+            "n_history": args.n_history,
+            "max_obstacles": args.max_obstacles,
+            "n_horizon": args.n_horizon,
 
             "in_dim": 7,
             "out_dim": 2,          # predict x,y
@@ -221,7 +216,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "predict_delta": True,
 
             "global_len": 1,       # keep global latent token
-            "seq_len": max_obstacles * n_history,
+            "seq_len": args.max_obstacles * args.n_history,
 
             "hidden_size": args.hidden_size,
             "expansion": 2.0,
@@ -299,7 +294,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         rdm_samples,
         device,
         epoch=start_epoch,
-        run_name=f'{RUN_NAME}_val',
+        run_name=f'debug_{RUN_NAME}_val',
         out_slice=config_dict["out_slice"]
     )
 
@@ -338,16 +333,18 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             metrics, outputs = train_batch(train_state, model_input)
 
             # calc extra metrics
+            batch_targets = train_state.carry.current_data['targets'] # accommodate asynchronous deep supervision
+            batch_targets_mask = train_state.carry.current_data['targets_mask'] # accommodate asynchronous deep supervision
             pred = outputs["pred"]
             ade, fde = compute_ade_fde(
-                pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+                pred, batch_targets, batch_targets_mask, out_slice=config_dict["out_slice"]
             )
 
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
-            targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
+            targets_xy_denorm = (batch_targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
             ade_real, fde_real = compute_ade_fde(
-                pred_xy_denorm, targets_xy_denorm, targets_mask, out_slice=config_dict["out_slice"]
+                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, out_slice=config_dict["out_slice"]
             )
 
             # log metrics
@@ -520,21 +517,22 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     rdm_samples,
                     device,
                     epoch=epoch+1,
-                    run_name=f'{RUN_NAME}_val',
+                    run_name=f'debug_{RUN_NAME}_val',
                     out_slice=config_dict["out_slice"],
                 )
 
-                plot_debug_batch(
-                    train_state,
-                    ood_dataset,
-                    ood_debug_batch,
-                    ood_rdm_agents,
-                    ood_rdm_samples,
-                    device,
-                    epoch=epoch+1,
-                    run_name=f'{RUN_NAME}_ood',
-                    out_slice=config_dict["out_slice"],
-                )
+                if ood_dataloader is not None:
+                    plot_debug_batch(
+                        train_state,
+                        ood_dataset,
+                        ood_debug_batch,
+                        ood_rdm_agents,
+                        ood_rdm_samples,
+                        device,
+                        epoch=epoch+1,
+                        run_name=f'debug_{RUN_NAME}_ood',
+                        out_slice=config_dict["out_slice"],
+                    )
 
 
         logger.log("-" * 30)
@@ -544,21 +542,19 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     tbd_writer.flush()
     tbd_writer.close()
 
-def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12, use_camera=False, use_lidar=False, use_bev=False):
-    print("Loading Dataset...")
-        
+def load_dataset(args):
     
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/ood.npz'
+    print("Loading Dataset...")
+    
+    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/train.npz'
+    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/val.npz'
+    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/test.npz'
+    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/ood.npz'
     
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
     
-    
-        
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -566,16 +562,16 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
-    tr_dataloader = DataLoader(tr_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
+    tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
+    val_dataloader = DataLoader(val_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
 
     pos_mean = stats["pos_mean"]
     pos_std  = stats["pos_std"]
@@ -586,9 +582,9 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
-        ood_dataloader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
+        ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
     else:
         ood_dataset = None
         ood_dataloader = None
@@ -618,8 +614,19 @@ if __name__ == "__main__":
     parser.add_argument("--camera", action="store_true", help="Use camera data.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+
+    # task parameters (non-defaults are used for sanity checking and testing)
+    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
+    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
+    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
     
     args = parser.parse_args()
+
+    # update task parameters
+    args.n_history = args.history_sec*SAMPLE_FREQ # current time inclusive
+    args.n_horizon = args.horizon_sec*SAMPLE_FREQ
+
+    print(f"n_history: {args.n_history}, n_horizon: {args.n_horizon}")
 
     # Optional CUDA debug envs (you can comment these out if you don't want sync execution)
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -633,7 +640,7 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     
     # load dataset
-    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size, n_history, n_horizon, args.camera, args.lidar, args.bev)
+    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
     
     # train
     train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy)
