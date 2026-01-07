@@ -9,10 +9,10 @@ def get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples):
     '''
     valid = obs_mask.detach().cpu().any(axis=1)    # (B, A) bool
 
-    valid_batches = []
-    while len(valid_batches) == 0 and goal_num_agents > 0:
-        valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
-        goal_num_agents -= 1
+    _, _, A = obs_mask.shape
+    goal_num_agents = min(A, goal_num_agents)
+    
+    valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
     if goal_num_agents == 0 and len(valid_batches) == 0:
         return None, None
 
