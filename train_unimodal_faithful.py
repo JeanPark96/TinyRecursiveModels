@@ -55,6 +55,9 @@ class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
+    optimizer_lr_schedule: bool
+    optimizer_lr_min_ratio: float
+    optimizer_lr_warmup_steps: int
     carry: Any
 
     step: int
@@ -82,14 +85,14 @@ def cosine_schedule_with_warmup_lr_lambda(
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
-# def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
-#     return cosine_schedule_with_warmup_lr_lambda(
-#         current_step=train_state.step,
-#         base_lr=base_lr,
-#         num_warmup_steps=round(config.lr_warmup_steps),
-#         num_training_steps=train_state.total_steps,
-#         min_ratio=config.lr_min_ratio
-#     )
+def compute_lr(base_lr: float, train_state: TrainState):
+    return cosine_schedule_with_warmup_lr_lambda(
+        current_step=train_state.step,
+        base_lr=base_lr,
+        num_warmup_steps=round(train_state.optimizer_lr_warmup_steps),
+        num_training_steps=train_state.total_steps,
+        min_ratio=train_state.optimizer_lr_min_ratio
+    )
 
 @torch.no_grad()
 def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
@@ -133,8 +136,10 @@ def train_batch(train_state: TrainState, batch: Any):
     # Apply optimizer
     lr_this_step = None    
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        # lr_this_step = compute_lr(base_lr, config, train_state)
-        lr_this_step = base_lr # not on a schedule right now
+        if train_state.optimizer_lr_schedule:
+            lr_this_step = compute_lr(base_lr, train_state)
+        else:
+            lr_this_step = base_lr
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
@@ -282,6 +287,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         model=ACTLossHeadNuScenes(model=model),
         optimizers=[optimizer],
         optimizer_lrs=[args.lr],
+        optimizer_lr_schedule=args.lr_schedule,
+        optimizer_lr_min_ratio=1.0,
+        optimizer_lr_warmup_steps=2000,
         carry=None
     )
     
@@ -596,6 +604,7 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_schedule", action="store_true", help="Use learning rate scheduler")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--halt_max_steps", type=int, default=1)
     parser.add_argument("--config_batch_size", type=int, default=16)
