@@ -1,1 +1,1 @@
-python train_unimodal_faithful.py --run_name sanitycheck_v2 --halt_max_steps 16 --gpu_id 2 --epochs 10000 --lr 1e-5 --config_batch_size 32
+python train_unimodal_faithful.py --run_name 1230_trm_mask_norm_do_v1 --halt_max_steps 16 --gpu_id 2 --epochs 10000 --lr 1e-5 --config_batch_size 32

@@ -12,6 +12,39 @@ import os
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import random
+import h5py
+import torch
+import numpy as np
+
+class HDF5FeatureLoader:
+    def __init__(self, h5_path):
+        self.h5_path = h5_path
+        self.h5_file = None
+        self.dset = None
+
+    def _open_file(self):
+        # We lazily open the file in the worker process to avoid pickling errors
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.h5_path, 'r')
+            self.dset = self.h5_file['features']
+
+    def get_features(self, idx):
+        """
+        Returns torch tensor for sample `idx`.
+        Shape: [T, 512, 9, 16]
+        """
+        self._open_file()
+        
+        # Read from disk (fast slice)
+        # Convert fp16 back to fp32 for PyTorch training stability
+        data = self.dset[idx].astype(np.float32)
+        
+        return torch.from_numpy(data)
+
+    def close(self):
+        if self.h5_file is not None:
+            self.h5_file.close()
+            self.h5_file = None
 
 def custom_collate(batch):
     'Necessary while LIDAR data list of variable length lists. If LIDAR is converted to BEV, this is no longer necessary'
@@ -33,14 +66,17 @@ def custom_collate(batch):
         collated['lidar'] = [b['lidar'] for b in batch]
     if 'bev' in batch[0]:
         collated['bev'] = np.stack([b['bev'] for b in batch])
+    if 'camera_features' in batch[0]:
+        collated['camera_features'] = torch.stack([b['camera_features'] for b in batch])
 
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, use_camera=False, use_lidar=False, use_bev=False, norm_stats=True):
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, use_camera=False, use_lidar=False, use_bev=False, use_preprocessed=False, feature_path=None, norm_stats=None):
         self.use_camera = use_camera
         self.use_lidar = use_lidar
         self.use_bev = use_bev
+        self.use_preprocessed = use_preprocessed
 
         self.n_history = n_history
         self.n_horizon = n_horizon
@@ -80,20 +116,14 @@ class NuScenesDataset(Dataset):
         self.n_samples = self.obs_pose.shape[0]
         self.raw_data_dir = raw_data_dir
         
-         # --- IMPORTANT: RESNET-18 PREPROCESSING PIPELINE ---
-        # 1. Resize to 256 (preserves aspect ratio)
-        # 2. Crop center 224x224
-        # 3. Convert to Tensor (0-1 float)
-        # 4. Normalize with ImageNet mean/std
-        self.resnet_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        self.use_preprocessed = use_preprocessed
+        
+        # Initialize Feature Loader if using preprocessed features
+        if self.use_camera and self.use_preprocessed:
+            if feature_path is None:
+                raise ValueError("You must provide 'feature_path' when use_preprocessed=True")
+            
+            self.feature_loader = HDF5FeatureLoader(feature_path)
 
     def __len__(self):
         return self.n_samples
@@ -118,40 +148,49 @@ class NuScenesDataset(Dataset):
 
     def __getitem__(self, idx):
         # single agent only
-        norm_obs_pose = self.normalize_positions(self.obs_pose[idx,:,0,:])
-        norm_targets  = self.normalize_positions(self.targets[idx,:,0,:])
-        sample = {
-            # agent masks
-            'obs_mask': self.obs_mask[idx,:,0].unsqueeze(1),         # (n_history,1)
-            'targets_mask': self.targets_mask[idx,:,0].unsqueeze(1), # (n_horizon,1) 
-            # raw ego-centric poses
-            'org_obs_pose': self.obs_pose[idx,:,0,:].unsqueeze(1),         # (n_history, 1, 7)
-            'org_targets': self.targets[idx,:,0,:].unsqueeze(1),           # (n_horizon, 1, 7)
-            # normalized ego-centric poses
-            "obs_pose": norm_obs_pose.unsqueeze(1),             # normalized xyz
-            "targets": norm_targets.unsqueeze(1),               # normalized xyz
-            'idx': idx,                             # scalar
-        }
-
-        # # Normalized pose (xyz only)
-        # norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
-        # norm_targets  = self.normalize_positions(self.targets[idx])
-        
+        # norm_obs_pose = self.normalize_positions(self.obs_pose[idx,:,0,:])
+        # norm_targets  = self.normalize_positions(self.targets[idx,:,0,:])
         # sample = {
         #     # agent masks
-        #     'obs_mask': self.obs_mask[idx],         # (n_history, MAX_OBSTACLES)
-        #     'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
+        #     'obs_mask': self.obs_mask[idx,:,0].unsqueeze(1),         # (n_history,1)
+        #     'targets_mask': self.targets_mask[idx,:,0].unsqueeze(1), # (n_horizon,1) 
         #     # raw ego-centric poses
-        #     'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
-        #     'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
+        #     'org_obs_pose': self.obs_pose[idx,:,0,:].unsqueeze(1),         # (n_history, 1, 7)
+        #     'org_targets': self.targets[idx,:,0,:].unsqueeze(1),           # (n_horizon, 1, 7)
         #     # normalized ego-centric poses
-        #     "obs_pose": norm_obs_pose,             # normalized xyz
-        #     "targets": norm_targets,               # normalized xyz
+        #     "obs_pose": norm_obs_pose.unsqueeze(1),             # normalized xyz
+        #     "targets": norm_targets.unsqueeze(1),               # normalized xyz
         #     'idx': idx,                             # scalar
         # }
+
+        # Normalized pose (xyz only)
+        norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
+        norm_targets  = self.normalize_positions(self.targets[idx])
+        
+        sample = {
+            # agent masks
+            'obs_mask': self.obs_mask[idx],         # (n_history, MAX_OBSTACLES)
+            'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
+            # raw ego-centric poses
+            'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
+            'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
+            # normalized ego-centric poses
+            "obs_pose": norm_obs_pose,             # normalized xyz
+            "targets": norm_targets,               # normalized xyz
+            'idx': idx,                             # scalar
+        }
+        # Camera Logic
         if self.use_camera:
-            camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])          
-            sample.update(camera=camera_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                # FAST: Load from HDF5
+                # Since you have separate files for train/val, 
+                # idx 0 in this dataset is guaranteed to be row 0 in the HDF5 file.
+                sample['camera_features'] = self.feature_loader.get_features(idx)
+            else:
+                # SLOW: Load raw JPGs
+                camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])          
+                sample.update(camera=camera_seq)        # list of n_history tensors
+        
         if self.use_lidar:
             lidar_seq  = [self.lidar_loader(f).tolist() for f in self.lidar_files[idx]]
             sample.update(lidar=lidar_seq)          # list of n_history tensors
