@@ -148,6 +148,7 @@ class NuScenesDataset(Dataset):
 
     def __getitem__(self, idx):
         # single agent only
+
         # norm_obs_pose = self.normalize_positions(self.obs_pose[idx,:,0,:])
         # norm_targets  = self.normalize_positions(self.targets[idx,:,0,:])
         # sample = {
@@ -162,6 +163,8 @@ class NuScenesDataset(Dataset):
         #     "targets": norm_targets.unsqueeze(1),               # normalized xyz
         #     'idx': idx,                             # scalar
         # }
+
+        # multiple agents
 
         # Normalized pose (xyz only)
         norm_obs_pose = self.normalize_positions(self.obs_pose[idx])
@@ -200,9 +203,15 @@ class NuScenesDataset(Dataset):
         return sample
 
     def get_obs_type(self, idx):
-        return self.obs_type[idx]           # (n_history, MAX_OBSTACLES)
+        '''
+        idx: scalar or list of indices
+        '''
+        return self.obs_type[idx]           # (MAX_OBSTACLES)
     
     def get_raw_data(self, idx):
+        '''
+        idx: scalar or list of indices
+        '''
         return {
             'ego_pose':self.ego_pose[idx],              # (n_history, 7)
             'raw_obs_pose':self.raw_obs_pose[idx],      # (n_history, MAX_OBSTACLES, 7)

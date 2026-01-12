@@ -274,7 +274,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         optimizer.load_state_dict(ckpt["optimizer"])
 
     # --- Choose a debug batch for qualitative comparison across epochs ---
-    debug_batch, debug_idx = select_debug_batch(val_dataloader, seed=args.seed)
+    debug_batch, debug_idx, rdm_agents, rdm_samples = select_debug_batch(val_dataloader, seed=args.seed)
     logger.log(f"Selected validation batch index {debug_idx} as debug batch for plotting.")
 
     # --- Choose a debug batch for ood for qualitative comparison across epochs ---
@@ -296,11 +296,14 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     # --- Plot BEFORE training/resume (using current model state) ---
     plot_debug_batch(
         train_state,
+        val_dataset,
         debug_batch,
+        rdm_agents,
+        rdm_samples,
         device,
         epoch=start_epoch,
         run_name=RUN_NAME,
-        out_slice=config_dict["out_slice"],
+        out_slice=config_dict["out_slice"]
     )
 
     # Training Loop
@@ -322,7 +325,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
-            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
+            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]        
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -483,16 +486,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             tbd_writer.add_scalar(f"FDE/val",val_fde,epoch+1)
             tbd_writer.add_scalar(f"ADE_real/val",val_ade_real,epoch+1)
             tbd_writer.add_scalar(f"FDE_real/val",val_fde_real,epoch+1)
-
-            # --- Plot debug batch AFTER this epoch ---
-            plot_debug_batch(
-                train_state,
-                debug_batch,
-                device,
-                epoch=epoch+1,
-                run_name=RUN_NAME,
-                out_slice=config_dict["out_slice"],
-            )
                 
             ############ Checkpointing
             epoch_ckpt_path = os.path.join(run_ckpt_dir, f"epoch_{epoch+1}.pth")
@@ -519,6 +512,19 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 torch.save(best_payload, best_ckpt_path)
                 logger.log(
                     f"New best model (val_loss={best_val_loss:.4f}); saved to {best_ckpt_path}"
+                )
+
+                # --- Plot debug batch AFTER this epoch if val loss improving---
+                plot_debug_batch(
+                    train_state,
+                    val_dataset,
+                    debug_batch,
+                    rdm_agents,
+                    rdm_samples,
+                    device,
+                    epoch=epoch+1,
+                    run_name=RUN_NAME,
+                    out_slice=config_dict["out_slice"],
                 )
 
         #TODO: ADD OOD EVAL
