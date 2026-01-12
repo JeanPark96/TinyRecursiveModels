@@ -35,21 +35,24 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
+import models.recursive_reasoning.trm_multimodal as trm_multimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
-importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v2 import (
+# from models.recursive_reasoning.trm_unimodal_v2 import (
+#     TRM_ACT_NuScenes,
+#     TRM_ACT_NuScenes_Config
+# )
+from models.recursive_reasoning.trm_multimodal import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
 
 SAMPLE_FREQ = 2
-max_obstacles = 1#30
+max_obstacles = 30
 n_history = 2*SAMPLE_FREQ # current time inclusive
 n_horizon = 2*SAMPLE_FREQ
 
@@ -527,7 +530,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     tbd_writer.flush()
     tbd_writer.close()
 
-def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12, use_camera=False, use_lidar=False, use_bev=False):
+def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12, use_camera=False, use_lidar=False, use_bev=False, use_preprocessed=False):
     print("Loading Dataset...")
         
     
@@ -538,10 +541,14 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
     
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
     
-    
+    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{split_type}_resnet_feat18/camera_features_train.h5"
+    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{split_type}_resnet_feat18/camera_features_val.h5"
+    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{split_type}_resnet_feat18/camera_features_test.h5"
+    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{split_type}_resnet_feat18/camera_features_ood.h5"
+
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, use_preprocessed=use_preprocessed, feature_path=train_vid_feat_path)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -549,11 +556,11 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, use_preprocessed=use_preprocessed, feature_path=val_vid_feat_path, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, use_preprocessed=use_preprocessed, feature_path=test_vid_feat_path, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
     tr_dataloader = DataLoader(tr_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
@@ -569,7 +576,7 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, use_preprocessed=use_preprocessed, feature_path=ood_vid_feat_path, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -599,6 +606,7 @@ if __name__ == "__main__":
     
     # modalities (always use pose data, but optionally add extra sensor data)
     parser.add_argument("--camera", action="store_true", help="Use camera data.")
+    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
     
@@ -614,9 +622,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    
+    print("video feature use: ", args.preprocessed_vid_fea)
     # load dataset
-    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size, n_history, n_horizon, args.camera, args.lidar, args.bev)
+    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size, 
+                                                                                                                                                              n_history, n_horizon, args.camera, args.lidar, args.bev,
+                                                                                                                                                              args.preprocessed_vid_fea)
     
     # train
     train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy)
