@@ -1,0 +1,1 @@
+python preprocessing_vid_feat.py --split_type standard

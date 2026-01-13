@@ -35,15 +35,18 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
+import models.recursive_reasoning.trm_multimodal as trm_multimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
-importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v2 import (
+# from models.recursive_reasoning.trm_unimodal_v2 import (
+#     TRM_ACT_NuScenes,
+#     TRM_ACT_NuScenes_Config
+# )
+from models.recursive_reasoning.trm_multimodal import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -551,7 +554,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     tbd_writer.close()
 
 def load_dataset(args):
-    
     print("Loading Dataset...")
 
     split_dir = args.split_type
@@ -574,6 +576,12 @@ def load_dataset(args):
               'BL':args.camera_BL,
               'BR':args.camera_BR}
     
+    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
+    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
+    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
+    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
+
+        
     print(f'Loading train dataset...')
     tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev)
     print('Loaded!')
@@ -639,6 +647,7 @@ if __name__ == "__main__":
     parser.add_argument("--camera_B", action="store_true", help="Use back camera data.")
     parser.add_argument("--camera_BL", action="store_true", help="Use back left camera data.")
     parser.add_argument("--camera_BR", action="store_true", help="Use back right camera data.")
+    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
 
@@ -665,7 +674,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    
+    print("video feature use: ", args.preprocessed_vid_fea)
     # load dataset
     tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
     

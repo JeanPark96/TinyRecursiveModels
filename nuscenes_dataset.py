@@ -12,6 +12,39 @@ import os
 import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 import random
+import h5py
+import torch
+import numpy as np
+
+class HDF5FeatureLoader:
+    def __init__(self, h5_path):
+        self.h5_path = h5_path
+        self.h5_file = None
+        self.dset = None
+
+    def _open_file(self):
+        # We lazily open the file in the worker process to avoid pickling errors
+        if self.h5_file is None:
+            self.h5_file = h5py.File(self.h5_path, 'r')
+            self.dset = self.h5_file['features']
+
+    def get_features(self, idx):
+        """
+        Returns torch tensor for sample `idx`.
+        Shape: [T, 512, 9, 16]
+        """
+        self._open_file()
+        
+        # Read from disk (fast slice)
+        # Convert fp16 back to fp32 for PyTorch training stability
+        data = self.dset[idx].astype(np.float32)
+        
+        return torch.from_numpy(data)
+
+    def close(self):
+        if self.h5_file is not None:
+            self.h5_file.close()
+            self.h5_file = None
 
 def custom_collate(batch):
     'Necessary while LIDAR data list of variable length lists. If LIDAR is converted to BEV, this is no longer necessary'
@@ -43,11 +76,23 @@ def custom_collate(batch):
         collated['lidar'] = [b['lidar'] for b in batch]
     if 'bev' in batch[0]:
         collated['bev'] = np.stack([b['bev'] for b in batch])
+    if 'camera_F_features' in batch[0]:
+        collated['camera_F_features'] = torch.stack([b['camera_F_features'] for b in batch])
+    if 'camera_FL_features' in batch[0]:
+        collated['camera_FL_features'] = torch.stack([b['camera_FL_features'] for b in batch])
+    if 'camera_FR_features' in batch[0]:
+        collated['camera_FR_features'] = torch.stack([b['camera_FR_features'] for b in batch])
+    if 'camera_B_features' in batch[0]:
+        collated['camera_B_features'] = torch.stack([b['camera_B_features'] for b in batch])
+    if 'camera_BL_features' in batch[0]:
+        collated['camera_BL_features'] = torch.stack([b['camera_BL_features'] for b in batch])
+    if 'camera_BR_features' in batch[0]:
+        collated['camera_BR_features'] = torch.stack([b['camera_BR_features'] for b in batch])
 
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, use_camera=False, use_lidar=False, use_bev=False, norm_stats=True):      
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, use_camera=False, use_lidar=False, use_bev=False, use_preprocessed=False, feature_path=None, norm_stats=True):      
         self.use_camera_F = use_camera['F']
         self.use_camera_FL = use_camera['FL']
         self.use_camera_FR = use_camera['FR']
@@ -56,6 +101,7 @@ class NuScenesDataset(Dataset):
         self.use_camera_BR = use_camera['BR']
         self.use_lidar = use_lidar
         self.use_bev = use_bev
+        self.use_preprocessed = use_preprocessed
 
         self.n_history = n_history
         self.n_horizon = n_horizon
@@ -102,21 +148,15 @@ class NuScenesDataset(Dataset):
 
         self.n_samples = self.obs_pose.shape[0]
         self.raw_data_dir = raw_data_dir
-        
-         # --- IMPORTANT: RESNET-18 PREPROCESSING PIPELINE ---
-        # 1. Resize to 256 (preserves aspect ratio)
-        # 2. Crop center 224x224
-        # 3. Convert to Tensor (0-1 float)
-        # 4. Normalize with ImageNet mean/std
-        self.resnet_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+                
+        # Initialize Feature Loader if using preprocessed features
+        if (self.use_camera_F or self.use_camera_FL or self.use_camera_FR or \
+            self.use_camera_B or self.use_camera_BL or self.use_camera_BR) and \
+            self.use_preprocessed:
+            if feature_path is None:
+                raise ValueError("You must provide 'feature_path' when use_preprocessed=True")
+            
+            self.feature_loader = HDF5FeatureLoader(feature_path)
 
     def __len__(self):
         return self.n_samples
@@ -162,24 +202,54 @@ class NuScenesDataset(Dataset):
             'idx': idx,                             # scalar
         }
 
+        # Camera Logic
         if self.use_camera_F:
-            camera_F_seq = torch.stack([self.camera_loader(f) for f in self.camera_F_files[idx]])          
-            sample.update(camera_F=camera_F_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                raise NotImplementedError
+                # FAST: Load from HDF5
+                # Since you have separate files for train/val, 
+                # idx 0 in this dataset is guaranteed to be row 0 in the HDF5 file.
+                sample['camera_F_features'] = self.feature_loader.get_features(idx)
+            else:
+                # SLOW: Load raw JPGs
+                camera_F_seq = torch.stack([self.camera_loader(f) for f in self.camera_F_files[idx]])          
+                sample.update(camera_F=camera_F_seq)        # list of n_history tensors
         if self.use_camera_FL:
-            camera_FL_seq = torch.stack([self.camera_loader(f) for f in self.camera_FL_files[idx]])          
-            sample.update(camera_FL=camera_FL_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                raise NotImplementedError
+                sample['camera_FL_features'] = self.feature_loader.get_features(idx)
+            else:
+                camera_FL_seq = torch.stack([self.camera_loader(f) for f in self.camera_FL_files[idx]])          
+                sample.update(camera_FL=camera_FL_seq)        # list of n_history tensors
         if self.use_camera_FR:
-            camera_FR_seq = torch.stack([self.camera_loader(f) for f in self.camera_FR_files[idx]])          
-            sample.update(camera_FR=camera_FR_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                raise NotImplementedError
+                sample['camera_FR_features'] = self.feature_loader.get_features(idx)
+            else:
+                camera_FR_seq = torch.stack([self.camera_loader(f) for f in self.camera_FR_files[idx]])          
+                sample.update(camera_FR=camera_FR_seq)        # list of n_history tensors
         if self.use_camera_B:
-            camera_B_seq = torch.stack([self.camera_loader(f) for f in self.camera_B_files[idx]])          
-            sample.update(camera_B=camera_B_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                raise NotImplementedError
+                sample['camera_B_features'] = self.feature_loader.get_features(idx)
+            else:
+                camera_B_seq = torch.stack([self.camera_loader(f) for f in self.camera_B_files[idx]])          
+                sample.update(camera_B=camera_B_seq)        # list of n_history tensors
         if self.use_camera_BL:
-            camera_BL_seq = torch.stack([self.camera_loader(f) for f in self.camera_BL_files[idx]])          
-            sample.update(camera_BL=camera_BL_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                raise NotImplementedError
+                sample['camera_BL_features'] = self.feature_loader.get_features(idx)
+            else:
+                camera_BL_seq = torch.stack([self.camera_loader(f) for f in self.camera_BL_files[idx]])          
+                sample.update(camera_BL=camera_BL_seq)        # list of n_history tensors
         if self.use_camera_BR:
-            camera_BR_seq = torch.stack([self.camera_loader(f) for f in self.camera_BR_files[idx]])          
-            sample.update(camera_BR=camera_BR_seq)        # list of n_history tensors
+            if self.use_preprocessed:
+                raise NotImplementedError
+                sample['camera_BR_features'] = self.feature_loader.get_features(idx)
+            else:
+                camera_BR_seq = torch.stack([self.camera_loader(f) for f in self.camera_BR_files[idx]])          
+                sample.update(camera_BR=camera_BR_seq)        # list of n_history tensors
+        
         if self.use_lidar:
             lidar_seq  = [self.lidar_loader(f).tolist() for f in self.lidar_files[idx]]
             sample.update(lidar=lidar_seq)          # list of n_history tensors

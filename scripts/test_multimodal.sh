@@ -1,0 +1,1 @@
+python train_unimodal_faithful.py --run_name 0111_mm_exp2 --preprocessed_vid_fea --halt_max_steps 16 --gpu_id 2 --epochs 2000 --lr 1e-5 --config_batch_size 16
