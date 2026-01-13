@@ -27,8 +27,18 @@ def custom_collate(batch):
     collated['idx'] = np.stack([b['idx'] for b in batch])
 
     # sensor data is not always used
-    if 'camera' in batch[0]:
-        collated['camera'] = torch.stack([b['camera'] for b in batch])
+    if 'camera_F' in batch[0]:
+        collated['camera_F'] = torch.stack([b['camera_F'] for b in batch])
+    if 'camera_FL' in batch[0]:
+        collated['camera_FL'] = torch.stack([b['camera_FL'] for b in batch])
+    if 'camera_FR' in batch[0]:
+        collated['camera_FR'] = torch.stack([b['camera_FR'] for b in batch])
+    if 'camera_B' in batch[0]:
+        collated['camera_B'] = torch.stack([b['camera_B'] for b in batch])
+    if 'camera_BL' in batch[0]:
+        collated['camera_BL'] = torch.stack([b['camera_BL'] for b in batch])
+    if 'camera_BR' in batch[0]:
+        collated['camera_BR'] = torch.stack([b['camera_BR'] for b in batch])
     if 'lidar' in batch[0]:
         collated['lidar'] = [b['lidar'] for b in batch]
     if 'bev' in batch[0]:
@@ -38,7 +48,12 @@ def custom_collate(batch):
 
 class NuScenesDataset(Dataset):
     def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, use_camera=False, use_lidar=False, use_bev=False, norm_stats=True):      
-        self.use_camera = use_camera
+        self.use_camera_F = use_camera['F']
+        self.use_camera_FL = use_camera['FL']
+        self.use_camera_FR = use_camera['FR']
+        self.use_camera_B = use_camera['B']
+        self.use_camera_BL = use_camera['BL']
+        self.use_camera_BR = use_camera['BR']
         self.use_lidar = use_lidar
         self.use_bev = use_bev
 
@@ -72,8 +87,13 @@ class NuScenesDataset(Dataset):
         self.raw_target = torch.from_numpy(data['raw_target'])[:, :n_horizon, :max_obstacles, :].reshape(-1, n_horizon, max_obstacles, 7).float() # (n_examples, n_horizon, max_obstacles, 7)
 
         # optional sensor data
-        if self.use_camera: self.camera_files = data['camera']        # filepaths: (n_examples, n_history)
-        if self.use_lidar: self.lidar_files = data['lidar']            # filepaths: (n_examples, n_history)
+        if self.use_camera_F: self.camera_F_files = data['camera'] if 'camera' in data else data['camera_F']        # filepaths: (n_examples, n_history)
+        if self.use_camera_FL: self.camera_FL_files = data['camera_FL'] # filepaths: (n_examples, n_history)
+        if self.use_camera_FR: self.camera_FR_files = data['camera_FR'] # filepaths: (n_examples, n_history)
+        if self.use_camera_B: self.camera_B_files = data['camera_B'] # filepaths: (n_examples, n_history)
+        if self.use_camera_BL: self.camera_BL_files = data['camera_BL'] # filepaths: (n_examples, n_history)
+        if self.use_camera_BR: self.camera_BR_files = data['camera_BR'] # filepaths: (n_examples, n_history)
+        if self.use_lidar: self.lidar_files = data['lidar']             # filepaths: (n_examples, n_history)
         if self.use_bev:
             if 'bev' in data: # necessary for old versions where bev is not in data
                 self.bev = self.unwrap_optional_array(data['bev'])     # None or (n_examples, n_history, 4, 256, 256)
@@ -142,9 +162,24 @@ class NuScenesDataset(Dataset):
             'idx': idx,                             # scalar
         }
 
-        if self.use_camera:
-            camera_seq = torch.stack([self.camera_loader(f) for f in self.camera_files[idx]])          
-            sample.update(camera=camera_seq)        # list of n_history tensors
+        if self.use_camera_F:
+            camera_F_seq = torch.stack([self.camera_loader(f) for f in self.camera_F_files[idx]])          
+            sample.update(camera_F=camera_F_seq)        # list of n_history tensors
+        if self.use_camera_FL:
+            camera_FL_seq = torch.stack([self.camera_loader(f) for f in self.camera_FL_files[idx]])          
+            sample.update(camera_FL=camera_FL_seq)        # list of n_history tensors
+        if self.use_camera_FR:
+            camera_FR_seq = torch.stack([self.camera_loader(f) for f in self.camera_FR_files[idx]])          
+            sample.update(camera_FR=camera_FR_seq)        # list of n_history tensors
+        if self.use_camera_B:
+            camera_B_seq = torch.stack([self.camera_loader(f) for f in self.camera_B_files[idx]])          
+            sample.update(camera_B=camera_B_seq)        # list of n_history tensors
+        if self.use_camera_BL:
+            camera_BL_seq = torch.stack([self.camera_loader(f) for f in self.camera_BL_files[idx]])          
+            sample.update(camera_BL=camera_BL_seq)        # list of n_history tensors
+        if self.use_camera_BR:
+            camera_BR_seq = torch.stack([self.camera_loader(f) for f in self.camera_BR_files[idx]])          
+            sample.update(camera_BR=camera_BR_seq)        # list of n_history tensors
         if self.use_lidar:
             lidar_seq  = [self.lidar_loader(f).tolist() for f in self.lidar_files[idx]]
             sample.update(lidar=lidar_seq)          # list of n_history tensors
