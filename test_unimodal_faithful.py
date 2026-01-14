@@ -49,17 +49,18 @@ from models.recursive_reasoning.trm_unimodal_v2 import (
 )
 
 SAMPLE_FREQ = 2
-max_obstacles = 1 #30
-n_history = 2*SAMPLE_FREQ # current time inclusive
-n_horizon = 2*SAMPLE_FREQ
-
-print(f"n_history: {n_history}, n_horizon: {n_horizon}")
+# max_obstacles = 1 #30
+# n_history = 2*SAMPLE_FREQ # current time inclusive
+# n_horizon = 2*SAMPLE_FREQ
 
 @dataclass
 class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
+    optimizer_lr_schedule: bool
+    optimizer_lr_min_ratio: float
+    optimizer_lr_warmup_steps: int
     carry: Any
 
     step: int
@@ -160,6 +161,9 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
         model=ACTLossHeadNuScenes(model=model),
         optimizers=[None],
         optimizer_lrs=[None],
+        optimizer_lr_schedule=False,
+        optimizer_lr_min_ratio=1.0,
+        optimizer_lr_warmup_steps=2000,
         carry=None
     )
 
@@ -282,25 +286,46 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
         )
         logger.log("Testing Complete.")
 
-def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12, use_camera=False, use_lidar=False, use_bev=False):
+def load_dataset(args):
     print("Loading Dataset...")
-        
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/train.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_type}/ood.npz'
+
+    split_dir = args.split_type
+    if args.bev:
+        split_dir = f'bev-{split_dir}'
+    if args.camera_FL or args.camera_FR or args.camera_B or args.camera_BL or args.camera_BR:
+        split_dir = f'cam-{split_dir}'
+    
+    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/train.npz'
+    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/val.npz'
+    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/test.npz'
+    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/ood.npz'
+    
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
 
+    camera = {'F':args.camera_F,
+              'FL':args.camera_FL,
+              'FR':args.camera_FR,
+              'B':args.camera_B,
+              'BL':args.camera_BL,
+              'BR':args.camera_BR}
+    
+    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
+    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
+    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
+    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
+
+        
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
 
     pos_mean = stats["pos_mean"]
     pos_std  = stats["pos_std"]
@@ -311,9 +336,9 @@ def load_dataset(split_type="standard", batch_size=16, n_history=4, n_horizon=12
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, n_history, n_horizon, use_camera=use_camera, use_lidar=use_lidar, use_bev=use_bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
-        ood_dataloader = DataLoader(ood_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate)
+        ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
     else:
         ood_dataset = None
         ood_dataloader = None
@@ -338,13 +363,29 @@ if __name__ == "__main__":
                                              'object-bendy', 'object-ambulance', 'object-police'],)
     
     # modalities (always use pose data, but optionally add extra sensor data)
-    parser.add_argument("--camera", action="store_true", help="Use camera data.")
+    parser.add_argument("--camera_F", action="store_true", help="Use front camera data.")
+    parser.add_argument("--camera_FL", action="store_true", help="Use front left camera data.")
+    parser.add_argument("--camera_FR", action="store_true", help="Use front right camera data.")
+    parser.add_argument("--camera_B", action="store_true", help="Use back camera data.")
+    parser.add_argument("--camera_BL", action="store_true", help="Use back left camera data.")
+    parser.add_argument("--camera_BR", action="store_true", help="Use back right camera data.")
+    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+    
+    # task parameters (non-defaults are used for sanity checking and testing)
+    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
+    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
+    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
     
     args = parser.parse_args()
 
     assert os.path.exists(args.model_pth)
+
+    # update task parameters
+    args.n_history = args.history_sec*SAMPLE_FREQ # current time inclusive
+    args.n_horizon = args.horizon_sec*SAMPLE_FREQ
+    print(f"n_history: {args.n_history}, n_horizon: {args.n_horizon}")
 
     # Optional CUDA debug envs (you can comment these out if you don't want sync execution)
     os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -358,8 +399,9 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     
     # load dataset
-    test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args.split_type, args.config_batch_size, n_history, n_horizon, args.camera, args.lidar, args.bev)
+    test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
     
     # test
     eval(args, test_dataset, test_dataloader, stats, mean_xy, std_xy, ood=False)
-    eval(args, ood_dataset, ood_dataloader, stats, mean_xy, std_xy, ood=True)
+    if 'standard' not in args.split_type:
+        eval(args, ood_dataset, ood_dataloader, stats, mean_xy, std_xy, ood=True)
