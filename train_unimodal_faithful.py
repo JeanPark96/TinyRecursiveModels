@@ -35,7 +35,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v3 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -47,7 +47,7 @@ import torch.optim as optim
 #     TRM_ACT_NuScenes_Config
 # )
 importlib.reload(trm_unimodal)
-from models.recursive_reasoning.trm_unimodal_v2 import (
+from models.recursive_reasoning.trm_unimodal_v3 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
