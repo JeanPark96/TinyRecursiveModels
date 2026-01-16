@@ -99,7 +99,7 @@ if __name__ == "__main__":
     # Initialize your dataset in 'raw' mode (loading jpgs)
     # Update paths to your real data
     SAMPLE_FREQ = 2
-    max_obstacles = 1#30
+    max_obstacles = 30#30
     n_history = 2*SAMPLE_FREQ # current time inclusive
     n_horizon = 6*SAMPLE_FREQ
     # Optional CUDA debug envs (you can comment these out if you don't want sync execution)
@@ -117,6 +117,6 @@ if __name__ == "__main__":
             dataset = NuScenesDataset(
                 data_pth=f'/home/vilin/Rapid_Adapt_SM/src/data/{split}/{ts}.npz', 
                 raw_data_dir="/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes", 
-                n_history=n_history, n_horizon=n_horizon, use_camera=True, use_lidar=False, use_bev=False, use_preprocessed=False, feature_path=None, norm_stats=None)
+                max_obstacles=max_obstacles, n_history=n_history, n_horizon=n_horizon, use_camera=True, use_lidar=False, use_bev=False, use_preprocessed=False, feature_path=None, norm_stats=None)
             os.makedirs(f"/home/vilin/Rapid_Adapt_SM/src/data/{split}_resnet_feat18", exist_ok=True)
             extract_to_hdf5(dataset, f"/home/vilin/Rapid_Adapt_SM/src/data/{split}_resnet_feat18/camera_features_{ts}.h5")
