@@ -24,7 +24,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
 # new imports
-from nuscenes_dataset import NuScenesDataset, custom_collate
+from nuscenes_dataset import load_dataset
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
@@ -217,6 +217,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "batch_size": args.config_batch_size,  # logical batch size; dataloader can differ
             "n_history": args.n_history,
             "max_obstacles": args.max_obstacles,
+            "max_predict": args.max_predict,
             "n_horizon": args.n_horizon,
 
             "in_dim": 7,
@@ -329,7 +330,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
-            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]        
+            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
+            print('target', targets.shape)
+            raise NotImplementedError    
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -554,73 +557,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     tbd_writer.flush()
     tbd_writer.close()
 
-def load_dataset(args):
-    print("Loading Dataset...")
-
-    split_dir = args.split_type
-    if args.bev:
-        split_dir = f'bev-{split_dir}'
-    if args.camera_FL or args.camera_FR or args.camera_B or args.camera_BL or args.camera_BR:
-        split_dir = f'cam-{split_dir}'
-    
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/ood.npz'
-    
-    raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
-
-    camera = {'F':args.camera_F,
-              'FL':args.camera_FL,
-              'FR':args.camera_FR,
-              'B':args.camera_B,
-              'BL':args.camera_BL,
-              'BR':args.camera_BR}
-    
-    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
-    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
-    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
-    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
-
-        
-    print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev)
-    print('Loaded!')
-    stats = tr_dataset.compute_normalization_stats()
-    print(f"Computed normalization stats: {stats}")
-    tr_dataset.set_norm_stats(stats)
-    print('Updated train dataset with normalization stats!')
-
-    print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
-    print(f'Loaded! {len(val_dataset)}')
-
-    print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
-    print(f'Loaded! {len(test_dataset)}')
-
-    tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
-    val_dataloader = DataLoader(val_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
-
-    pos_mean = stats["pos_mean"]
-    pos_std  = stats["pos_std"]
-    mean_xy = pos_mean[:2]                         # [2]
-    std_xy  = pos_std[:2]                          # [2]
-
-    print("Denormalize params: ", mean_xy, std_xy)
-
-    if 'standard' not in args.split_type:
-        print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
-        print(f'Loaded ood dataset! {len(ood_dataset)}')
-        ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
-    else:
-        ood_dataset = None
-        ood_dataloader = None
-
-    return tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
@@ -653,10 +589,12 @@ if __name__ == "__main__":
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
 
     # task parameters (non-defaults are used for sanity checking and testing)
-    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
-    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
-    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
-    
+    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds.')
+    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds.')
+    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles in context.')
+    parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
+    parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
+
     args = parser.parse_args()
 
     # update task parameters
