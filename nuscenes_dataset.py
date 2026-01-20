@@ -216,7 +216,7 @@ class NuScenesDataset(Dataset):
         dists = torch.linalg.norm(self.obs_pose[:, -1, :, :2], dim=-1) # (n_examples, max_obstacles)
         masked_dists = dists.masked_fill(candidate_obstacles==0, float("inf")) # (n_examples, max_obstacles)
         sorted_idx = masked_dists.argsort(dim=1) # (n_examples, max_obstacles)
-        self.target_idx = sorted_idx[:, :max_predict] # (n_examples, max_predict) may or may not all be valid obstacles, need dto refer to mask
+        self.target_idx = sorted_idx[:, :max_predict] # (n_examples, max_predict) may or may not all be valid obstacles, need to refer to mask
         assert self.target_idx.shape[1] == max_predict
 
         # future agent mask

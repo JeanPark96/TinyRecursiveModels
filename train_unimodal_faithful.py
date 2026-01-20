@@ -28,6 +28,7 @@ from nuscenes_dataset import load_dataset
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
+from utils.metrics import compute_metrics
 from models.losses import ACTLossHeadNuScenes
 import random
 import numpy as np
@@ -97,26 +98,6 @@ def compute_lr(base_lr: float, train_state: TrainState):
         num_training_steps=train_state.total_steps,
         min_ratio=train_state.optimizer_lr_min_ratio
     )
-
-@torch.no_grad()
-def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
-    """
-    Returns scalar ADE/FDE (averaged over valid agents+timesteps).
-    """
-    tgt = targets[..., :out_slice].permute(0, 2, 1, 3).contiguous()         # [B,A,H,2]
-    m = targets_mask.permute(0, 2, 1).to(pred.dtype).contiguous()           # [B,A,H]
-
-    pred_xy = pred[..., :out_slice]
-    dist = torch.linalg.norm(pred_xy - tgt, dim=-1)                         # [B,A,H]
-
-    ade = (dist * m).sum() / (m.sum() + 1e-6)
-
-    # FDE: last horizon step only
-    dist_last = dist[:, :, -1]
-    m_last = m[:, :, -1]
-    fde = (dist_last * m_last).sum() / (m_last.sum() + 1e-6)
-
-    return ade.item(), fde.item()
 
 def train_batch(train_state: TrainState, batch: Any):
     train_state.step += 1
@@ -319,11 +300,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         train_state.model.train()
 
         # step-wise stats
-        running_loss = running_ade = running_fde = running_ade_real = running_fde_real = 0.0
+        running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
         running_count = 0
 
         # epoch-wise stats
-        tr_ade_sum = tr_fde_sum = tr_ade_real_sum = tr_fde_real_sum = tr_loss_sum = 0.0
+        tr_ade_sum = tr_fde_sum = tr_ade_real_sum = tr_fde_real_sum = tr_loss_sum = tr_mr_sum= 0.0
         tr_n = 0
 
         for batch_idx, batch in enumerate(tr_dataloader):
@@ -331,8 +312,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
             targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
-            print('target', targets.shape)
-            raise NotImplementedError    
+            targets_idx = batch["targets_idx"]
+            print(obs_pose.shape, obs_mask.shape, targets.shape, targets_mask.shape, targets_idx.shape)
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -351,15 +332,15 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             batch_targets = train_state.carry.current_data['targets'] # accommodate asynchronous deep supervision
             batch_targets_mask = train_state.carry.current_data['targets_mask'] # accommodate asynchronous deep supervision
             pred = outputs["pred"]
-            ade, fde = compute_ade_fde(
-                pred, batch_targets, batch_targets_mask, out_slice=config_dict["out_slice"]
+            ade, fde, _ = compute_metrics(
+                pred, batch_targets, batch_targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
             )
 
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
             targets_xy_denorm = (batch_targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-            ade_real, fde_real = compute_ade_fde(
-                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, out_slice=config_dict["out_slice"]
+            ade_real, fde_real, mr = compute_metrics(
+                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
             )
 
             # log metrics
@@ -367,6 +348,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             running_fde += fde
             running_ade_real += ade_real
             running_fde_real += fde_real
+            running_mr += mr
             running_loss += metrics['train/loss']
             running_count += 1
             if train_state.step % 50 == 0:
@@ -376,15 +358,17 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     f"ADE: {running_ade/running_count:.4f} | "
                     f"FDE: {running_fde/running_count:.4f} | "
                     f"ADE_real: {running_ade_real/running_count:.4f} | "
-                    f"FDE_real: {running_fde_real/running_count:.4f}" 
+                    f"FDE_real: {running_fde_real/running_count:.4f} | "
+                    f"Miss_rate: {running_mr/running_count:.2f}"
                 )
-                running_loss = running_ade = running_fde = running_ade_real = running_fde_real = 0.0
+                running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
                 running_count = 0
 
             tr_ade_sum += ade
             tr_fde_sum += fde
             tr_ade_real_sum += ade_real
             tr_fde_real_sum += fde_real
+            tr_mr_sum += mr
             tr_loss_sum += metrics['train/loss']
             tr_n += 1
 
@@ -394,13 +378,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         tbd_writer.add_scalar(f"FDE/train", tr_fde_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"ADE_real/train", tr_ade_real_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"FDE_real/train", tr_fde_real_sum / max(tr_n, 1), epoch+1)
-
+        tbd_writer.add_scalar(f"Miss_rate/train", tr_mr_sum / max(tr_n, 1), epoch+1)
 
         ############ Evaluation
         if epoch % 1 == 0:
             logger.log("Running Validation...")
             train_state.model.eval()
-            val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = 0.0
+            val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = val_mr_sum = 0.0
             val_n = 0
 
             with torch.no_grad():
@@ -455,15 +439,15 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                             
                     # calc extra metrics
                     pred = outputs["pred"]
-                    ade, fde = compute_ade_fde(
-                        pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+                    ade, fde, _ = compute_metrics(
+                        pred, targets, targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
                     )
 
                     pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
                     targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-                    ade_real, fde_real = compute_ade_fde(
-                        pred_xy_denorm, targets_xy_denorm, targets_mask, out_slice=config_dict["out_slice"]
+                    ade_real, fde_real, mr = compute_metrics(
+                        pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
                     )
 
                     # log metrics
@@ -471,6 +455,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     val_fde_sum += fde
                     val_ade_real_sum += ade_real
                     val_fde_real_sum += fde_real
+                    val_mr_sum += mr
                     val_loss_sum += reduced_metrics['val/loss']
                     val_n += 1
 
@@ -478,6 +463,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             val_fde = val_fde_sum / max(val_n, 1)
             val_ade_real = val_ade_real_sum / max(val_n, 1)
             val_fde_real = val_fde_real_sum / max(val_n, 1)
+            val_mr = val_mr_sum / max(val_n, 1)
             val_loss = val_loss_sum / max(val_n, 1)
 
             logger.log(
@@ -486,7 +472,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 f"ADE: {val_ade:.4f} | "
                 f"FDE: {val_fde:.4f} | "
                 f"Real ADE: {val_ade_real:.4f} | "
-                f"Real FDE: {val_fde_real:.4f}"
+                f"Real FDE: {val_fde_real:.4f} | "
+                f"Miss rate: {val_mr:.2f}"
             )
 
             # tensorboard logging
@@ -495,6 +482,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             tbd_writer.add_scalar(f"FDE/val",val_fde,epoch+1)
             tbd_writer.add_scalar(f"ADE_real/val",val_ade_real,epoch+1)
             tbd_writer.add_scalar(f"FDE_real/val",val_fde_real,epoch+1)
+            tbd_writer.add_scalar(f"Miss_rate/val",val_mr,epoch+1)
                 
             ############ Checkpointing
             epoch_ckpt_path = os.path.join(run_ckpt_dir, f"epoch_{epoch+1}.pth")
@@ -507,6 +495,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 "val_loss": val_loss,
                 "val_ade": val_ade,
                 "val_fde": val_fde,
+                "val_mr": val_mr,
                 "best_val_loss": best_val_loss,
             }
             torch.save(ckpt_payload, epoch_ckpt_path)
