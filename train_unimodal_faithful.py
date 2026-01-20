@@ -35,7 +35,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v3 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -47,7 +47,7 @@ import torch.optim as optim
 #     TRM_ACT_NuScenes_Config
 # )
 importlib.reload(trm_unimodal)
-from models.recursive_reasoning.trm_unimodal_v3 import (
+from models.recursive_reasoning.trm_unimodal_v2 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -587,6 +587,7 @@ if __name__ == "__main__":
     parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+    parser.add_argument('--map', action='store_true', help='Add map context.')
 
     # task parameters (non-defaults are used for sanity checking and testing)
     parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds.')

@@ -28,6 +28,9 @@ def load_dataset(args):
         split_dir = f'bev-{split_dir}'
     if args.camera_FL or args.camera_FR or args.camera_B or args.camera_BL or args.camera_BR:
         split_dir = f'cam-{split_dir}'
+    if args.map:
+        split_dir = f"loc-{split_dir}"
+
     
     train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/train.npz'
     val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/val.npz'
@@ -50,7 +53,7 @@ def load_dataset(args):
 
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -58,11 +61,11 @@ def load_dataset(args):
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
     tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
@@ -78,7 +81,7 @@ def load_dataset(args):
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -164,7 +167,7 @@ def custom_collate(batch):
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_preprocessed=False, feature_path=None, norm_stats=True):      
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, use_preprocessed=False, feature_path=None, norm_stats=True):      
         self.use_camera_F = use_camera['F']
         self.use_camera_FL = use_camera['FL']
         self.use_camera_FR = use_camera['FR']
@@ -173,7 +176,11 @@ class NuScenesDataset(Dataset):
         self.use_camera_BR = use_camera['BR']
         self.use_lidar = use_lidar
         self.use_bev = use_bev
+        self.use_map = use_map
         self.use_preprocessed = use_preprocessed
+
+        if self.use_map:
+            raise NotImplementedError('Must define map features to use')
 
         self.n_history = n_history
         self.n_horizon = n_horizon

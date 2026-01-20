@@ -24,7 +24,7 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
 # new imports
-from nuscenes_dataset import NuScenesDataset, custom_collate
+from nuscenes_dataset import load_dataset
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, plot_test_batch
@@ -35,7 +35,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v3 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -43,7 +43,7 @@ importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v3 import (
+from models.recursive_reasoning.trm_unimodal_v2 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -286,65 +286,6 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
         )
         logger.log("Testing Complete.")
 
-def load_dataset(args):
-    print("Loading Dataset...")
-
-    split_dir = args.split_type
-    if args.bev:
-        split_dir = f'bev-{split_dir}'
-    if args.camera_FL or args.camera_FR or args.camera_B or args.camera_BL or args.camera_BR:
-        split_dir = f'cam-{split_dir}'
-    
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/ood.npz'
-    
-    raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
-
-    camera = {'F':args.camera_F,
-              'FL':args.camera_FL,
-              'FR':args.camera_FR,
-              'B':args.camera_B,
-              'BL':args.camera_BL,
-              'BR':args.camera_BR}
-    
-    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
-    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
-    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
-    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
-
-        
-    print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev)
-    print('Loaded!')
-    stats = tr_dataset.compute_normalization_stats()
-    print(f"Computed normalization stats: {stats}")
-
-    print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
-    print(f'Loaded! {len(test_dataset)}')
-
-    test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
-
-    pos_mean = stats["pos_mean"]
-    pos_std  = stats["pos_std"]
-    mean_xy = pos_mean[:2]                         # [2]
-    std_xy  = pos_std[:2]                          # [2]
-
-    print("Denormalize params: ", mean_xy, std_xy)
-
-    if 'standard' not in args.split_type:
-        print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
-        print(f'Loaded ood dataset! {len(ood_dataset)}')
-        ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
-    else:
-        ood_dataset = None
-        ood_dataloader = None
-
-    return test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
@@ -399,8 +340,8 @@ if __name__ == "__main__":
         torch.cuda.manual_seed_all(args.seed)
     
     # load dataset
-    test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
-    
+    _, _, test_dataset, ood_dataset, _, _, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
+
     # test
     eval(args, test_dataset, test_dataloader, stats, mean_xy, std_xy, ood=False)
     if 'standard' not in args.split_type:
