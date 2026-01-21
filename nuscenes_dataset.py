@@ -216,7 +216,7 @@ class NuScenesDataset(Dataset):
         dists = torch.linalg.norm(self.obs_pose[:, -1, :, :2], dim=-1) # (n_examples, max_obstacles)
         masked_dists = dists.masked_fill(candidate_obstacles==0, float("inf")) # (n_examples, max_obstacles)
         sorted_idx = masked_dists.argsort(dim=1) # (n_examples, max_obstacles)
-        self.target_idx = sorted_idx[:, :max_predict] # (n_examples, max_predict) may or may not all be valid obstacles, need to refer to mask
+        self.target_idx, _ = sorted_idx[:, :max_predict].sort(dim=1) # (n_examples, max_predict) may or may not all be valid obstacles, need to refer to mask
         assert self.target_idx.shape[1] == max_predict
 
         # future agent mask
@@ -227,7 +227,7 @@ class NuScenesDataset(Dataset):
         self.targets = np.take_along_axis(data['targets'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
         self.targets = torch.from_numpy(self.targets).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
 
-        # future global frame pose
+        # # future global frame pose
         self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].reshape(-1, n_horizon, 7).float() # (n_examples, n_horizon, 7)
         self.raw_target = np.take_along_axis(data['raw_target'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
         self.raw_target = torch.from_numpy(self.raw_target).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
