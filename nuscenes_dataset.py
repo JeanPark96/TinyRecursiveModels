@@ -211,8 +211,8 @@ class NuScenesDataset(Dataset):
         # select agents to predict based on current time step
         candidate_obstacles = self.obs_mask[:, -1, :] # (n_examples, max_obstacles)
         if dynamic_only:
-            dynamic_idx = torch.from_numpy(np.isin(self.obs_type, DYNAMIC_TYPES)) # (n_examples, max_obstacles)
-            candidate_obstacles = candidate_obstacles & dynamic_idx # (n_examples, max_obstacles)
+            dynamic_obstacles = torch.from_numpy(np.isin(self.obs_type, DYNAMIC_TYPES)) # (n_examples, max_obstacles)
+            candidate_obstacles = candidate_obstacles & dynamic_obstacles # (n_examples, max_obstacles)
         dists = torch.linalg.norm(self.obs_pose[:, -1, :, :2], dim=-1) # (n_examples, max_obstacles)
         masked_dists = dists.masked_fill(candidate_obstacles==0, float("inf")) # (n_examples, max_obstacles)
         sorted_idx = masked_dists.argsort(dim=1) # (n_examples, max_obstacles)
@@ -220,7 +220,11 @@ class NuScenesDataset(Dataset):
         assert self.target_idx.shape[1] == max_predict
 
         # future agent mask
-        self.targets_mask = np.take_along_axis(data['targets_mask'][:, :n_horizon, :], self.target_idx[:, None, :].numpy(), axis=2)
+        self.targets_mask = data['targets_mask'][:, :n_horizon, :] # (n_examples, n_horizon, max_obstacles)
+        if dynamic_only:
+            self.targets_mask = self.targets_mask * dynamic_obstacles[:,None,:].numpy()
+            self.obs_mask = self.obs_mask * dynamic_obstacles[:,None,:]
+        self.targets_mask = np.take_along_axis(self.targets_mask, self.target_idx[:, None, :].numpy(), axis=2)
         self.targets_mask = torch.from_numpy(self.targets_mask).reshape(-1, n_horizon, max_predict) # (n_examples, n_horizon, max_predict)
 
         # future ego-centric pose
