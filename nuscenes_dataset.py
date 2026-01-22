@@ -16,6 +16,80 @@ import h5py
 import torch
 import numpy as np
 
+DYNAMIC_TYPES = ['animal',
+                 'adult', 'child', 'construction_worker', 'personal_mobility', 'police_officer', 'stroller', 'wheelchair',
+                 'bicycle', 'bendy', 'rigid', 'car', 'construction', 'ambulance', 'police', 'motorcycle', 'trailer', 'truck',]
+
+def load_dataset(args):
+    print("Loading Dataset...")
+
+    split_dir = args.split_type
+    if args.bev:
+        split_dir = f'bev-{split_dir}'
+    if args.camera_FL or args.camera_FR or args.camera_B or args.camera_BL or args.camera_BR:
+        split_dir = f'cam-{split_dir}'
+    if args.map:
+        split_dir = f"loc-{split_dir}"
+
+    
+    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/train.npz'
+    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/val.npz'
+    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/test.npz'
+    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/ood.npz'
+    
+    raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
+
+    camera = {'F':args.camera_F,
+              'FL':args.camera_FL,
+              'FR':args.camera_FR,
+              'B':args.camera_B,
+              'BL':args.camera_BL,
+              'BR':args.camera_BR}
+    
+    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
+    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
+    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
+    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
+
+        
+    print(f'Loading train dataset...')
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map)
+    print('Loaded!')
+    stats = tr_dataset.compute_normalization_stats()
+    print(f"Computed normalization stats: {stats}")
+    tr_dataset.set_norm_stats(stats)
+    print('Updated train dataset with normalization stats!')
+
+    print(f'Loading val dataset...')
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
+    print(f'Loaded! {len(val_dataset)}')
+
+    print(f'Loading test dataset...')
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
+    print(f'Loaded! {len(test_dataset)}')
+
+    tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
+    val_dataloader = DataLoader(val_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
+
+    pos_mean = stats["pos_mean"]
+    pos_std  = stats["pos_std"]
+    mean_xy = pos_mean[:2]                         # [2]
+    std_xy  = pos_std[:2]                          # [2]
+
+    print("Denormalize params: ", mean_xy, std_xy)
+
+    if 'standard' not in args.split_type:
+        print(f'Loading ood dataset...')
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
+        print(f'Loaded ood dataset! {len(ood_dataset)}')
+        ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
+    else:
+        ood_dataset = None
+        ood_dataloader = None
+
+    return tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
+
 class HDF5FeatureLoader:
     def __init__(self, h5_path):
         self.h5_path = h5_path
@@ -59,6 +133,7 @@ def custom_collate(batch):
     collated['org_targets']  = torch.stack([b['org_targets'] for b in batch])
     collated['targets_mask']  = torch.stack([b['targets_mask'] for b in batch])
     collated['idx'] = np.stack([b['idx'] for b in batch])
+    collated['targets_idx'] = torch.stack([b['targets_idx'] for b in batch])
 
     # sensor data is not always used
     if 'camera_F' in batch[0]:
@@ -93,7 +168,7 @@ def custom_collate(batch):
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, use_camera=None, use_lidar=False, use_bev=False, use_preprocessed=False, feature_path=None, norm_stats=True):      
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, use_preprocessed=False, feature_path=None, norm_stats=True):      
         self.use_camera_F = use_camera['F']
         self.use_camera_FL = use_camera['FL']
         self.use_camera_FR = use_camera['FR']
@@ -102,7 +177,11 @@ class NuScenesDataset(Dataset):
         self.use_camera_BR = use_camera['BR']
         self.use_lidar = use_lidar
         self.use_bev = use_bev
+        self.use_map = use_map
         self.use_preprocessed = use_preprocessed
+
+        if self.use_map:
+            raise NotImplementedError('Must define map features to use')
 
         self.n_history = n_history
         self.n_horizon = n_horizon
@@ -111,27 +190,52 @@ class NuScenesDataset(Dataset):
         data = np.load(data_pth, allow_pickle=True)
         assert n_horizon <= data['targets_mask'].shape[1]
         assert n_history <= data['obs_mask'].shape[1]
-        assert max_obstacles <= data['targets_mask'].shape[2]
-
+        assert max_obstacles == data['targets_mask'].shape[2], f"Max obstacles must be {data['targets_mask'].shape[2]}"
+        assert max_predict <= max_obstacles
+        
         # pose normalization statistics
         self.norm_stats = norm_stats
 
-        # agent masks
-        self.obs_mask = torch.from_numpy(data['obs_mask'])[:, -n_history:, :max_obstacles].reshape(-1, n_history, max_obstacles)  # (n_examples, n_history, max_obstacles)
-        self.targets_mask = torch.from_numpy(data['targets_mask'])[:, :n_horizon, :max_obstacles].reshape(-1, n_horizon, max_obstacles)  # (n_examples, n_horizon, max_obstacles)
-
         # agent type
-        self.obs_type = data['obs_type'][:, :max_obstacles].reshape(-1, max_obstacles) # strings: (n_examples, max_obstacles)
+        self.obs_type = data['obs_type'] # strings: (n_examples, total_obstacles)
 
-        # ego-centric pose
-        self.obs_pose = torch.from_numpy(data['obs_pose'])[:, -n_history:, :max_obstacles, :].reshape(-1, n_history, max_obstacles, 7).float() # (n_examples, n_history, max_obstacles, 7)
-        self.targets = torch.from_numpy(data['targets'])[:, :n_horizon, :max_obstacles, :].reshape(-1, n_horizon, max_obstacles, 7).float() # (n_examples, n_horizon, max_obstacles, 7)
+        # history agent mask
+        self.obs_mask = torch.from_numpy(data['obs_mask'])[:, -n_history:, :].reshape(-1, n_history, max_obstacles)  # (n_examples, n_history, max_obstacles)
         
-        # global frame pose
+        # history ego-centric pose
+        self.obs_pose = torch.from_numpy(data['obs_pose'])[:, -n_history:, :, :].reshape(-1, n_history, max_obstacles, 7).float() # (n_examples, n_history, max_obstacles, 7)
+        
+        # history global frame pose
         self.ego_pose = torch.from_numpy(data['ego_pose'])[:, -n_history:, :].reshape(-1, n_history, 7).float() # (n_examples, n_history, 7)
-        self.raw_obs_pose = torch.from_numpy(data['raw_obs_pose'])[:, -n_history:, :max_obstacles, :].reshape(-1, n_history, max_obstacles, 7).float() # (n_examples, n_history, max_obstacles, 7)
+        self.raw_obs_pose = torch.from_numpy(data['raw_obs_pose'])[:, -n_history:, :, :].reshape(-1, n_history, max_obstacles, 7).float() # (n_examples, n_history, max_obstacles, 7)
+
+        # select agents to predict based on current time step
+        candidate_obstacles = self.obs_mask[:, -1, :] # (n_examples, max_obstacles)
+        if dynamic_only:
+            dynamic_obstacles = torch.from_numpy(np.isin(self.obs_type, DYNAMIC_TYPES)) # (n_examples, max_obstacles)
+            candidate_obstacles = candidate_obstacles & dynamic_obstacles # (n_examples, max_obstacles)
+        dists = torch.linalg.norm(self.obs_pose[:, -1, :, :2], dim=-1) # (n_examples, max_obstacles)
+        masked_dists = dists.masked_fill(candidate_obstacles==0, float("inf")) # (n_examples, max_obstacles)
+        sorted_idx = masked_dists.argsort(dim=1) # (n_examples, max_obstacles)
+        self.target_idx, _ = sorted_idx[:, :max_predict].sort(dim=1) # (n_examples, max_predict) may or may not all be valid obstacles, need to refer to mask
+        assert self.target_idx.shape[1] == max_predict
+
+        # future agent mask
+        self.targets_mask = data['targets_mask'][:, :n_horizon, :] # (n_examples, n_horizon, max_obstacles)
+        if dynamic_only:
+            self.targets_mask = self.targets_mask * dynamic_obstacles[:,None,:].numpy()
+            self.obs_mask = self.obs_mask * dynamic_obstacles[:,None,:]
+        self.targets_mask = np.take_along_axis(self.targets_mask, self.target_idx[:, None, :].numpy(), axis=2)
+        self.targets_mask = torch.from_numpy(self.targets_mask).reshape(-1, n_horizon, max_predict) # (n_examples, n_horizon, max_predict)
+
+        # future ego-centric pose
+        self.targets = np.take_along_axis(data['targets'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
+        self.targets = torch.from_numpy(self.targets).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
+
+        # # future global frame pose
         self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].reshape(-1, n_horizon, 7).float() # (n_examples, n_horizon, 7)
-        self.raw_target = torch.from_numpy(data['raw_target'])[:, :n_horizon, :max_obstacles, :].reshape(-1, n_horizon, max_obstacles, 7).float() # (n_examples, n_horizon, max_obstacles, 7)
+        self.raw_target = np.take_along_axis(data['raw_target'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
+        self.raw_target = torch.from_numpy(self.raw_target).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
 
         # optional sensor data
         if self.use_camera_F: self.camera_F_files = data['camera'] if 'camera' in data else data['camera_F']        # filepaths: (n_examples, n_history)
@@ -191,12 +295,14 @@ class NuScenesDataset(Dataset):
         norm_targets  = self.normalize_positions(self.targets[idx])
         
         sample = {
+            # selected agents to predict
+            'targets_idx': self.target_idx[idx], # (max_predict)
             # agent masks
-            'obs_mask': self.obs_mask[idx],         # (n_history, MAX_OBSTACLES)
-            'targets_mask': self.targets_mask[idx], # (n_horizon, MAX_OBSTACLES) 
+            'obs_mask': self.obs_mask[idx],         # (n_history, max_obstacles)
+            'targets_mask': self.targets_mask[idx], # (n_horizon, max_predict) 
             # raw ego-centric poses
-            'org_obs_pose': self.obs_pose[idx],         # (n_history, MAX_OBSTACLES, 7)
-            'org_targets': self.targets[idx],           # (n_horizon, MAX_OBSTACLES, 7)
+            'org_obs_pose': self.obs_pose[idx],         # (n_history, max_obstacles, 7)
+            'org_targets': self.targets[idx],           # (n_horizon, max_predict, 7)
             # normalized ego-centric poses
             "obs_pose": norm_obs_pose,             # normalized xyz
             "targets": norm_targets,               # normalized xyz
@@ -304,7 +410,7 @@ class NuScenesDataset(Dataset):
         '''
         idx: scalar or list of indices
         '''
-        return self.obs_type[idx]           # (MAX_OBSTACLES)
+        return self.obs_type[idx]           # (max_obstacles)
     
     def get_raw_data(self, idx):
         '''
@@ -312,9 +418,9 @@ class NuScenesDataset(Dataset):
         '''
         return {
             'ego_pose':self.ego_pose[idx],              # (n_history, 7)
-            'raw_obs_pose':self.raw_obs_pose[idx],      # (n_history, MAX_OBSTACLES, 7)
+            'raw_obs_pose':self.raw_obs_pose[idx],      # (n_history, max_obstacles, 7)
             'ego_target':self.ego_target[idx],          # (n_horizon, 7)
-            'raw_target':self.raw_target[idx],          # (n_horizon, MAX_OBSTACLES, 7)
+            'raw_target':self.raw_target[idx],          # (n_horizon, max_predict, 7)
         }
     
 
