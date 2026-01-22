@@ -17,6 +17,7 @@ V4 is ased off of V2.
 V3, which primarily added add/norm in the decoder block, is skipped due to poor performance.
 Major changes in this version:
     Allow number of output agents to be less than number of input agents
+    Incorporate target idx in decoding process
 '''
 
 # =========================
@@ -327,13 +328,19 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_obs = self.config.n_history
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
+        targets_idx = batch["targets_idx"]
 
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
         agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
 
         # 2. Reshape to independent sequences: [B, Aout*T_obs, D]
         #    This groups all history for a specific agent together.
-        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D).view(B, A * T_obs, D)
+        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D)
+        if Aout < A:
+            history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
+            history_kv = history_kv.view(B, Aout * T_obs, D)
+        else:
+            history_kv = history_kv.view(B, A * T_obs, D)
 
         # 3. Expand future queries: [B, Aout*T_pred, D]
         queries = self.future_queries.expand(B, Aout, -1, -1).reshape(B, Aout * T_pred, D)
@@ -353,8 +360,6 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         pred = pred_flat.view(B, Aout, T_pred, self.config.out_dim)
 
         # =================================================================
-
-        targets_idx = batch["targets_idx"]
 
         # delta decoding for first out_slice dims
         if self.config.predict_delta and self.config.out_slice > 0:
