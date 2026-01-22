@@ -3,13 +3,13 @@ import torch
 import os
 import numpy as np
 
-def get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples):
+def get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples):
     '''
     From mask, choose only indices with non-null agent slots (history mask is not completely zero)
     '''
-    valid = obs_mask.detach().cpu().any(axis=1)    # (B, A) bool
+    valid = targets_mask.detach().cpu().any(axis=1)    # (B, A) bool
 
-    _, _, A = obs_mask.shape
+    _, _, A = targets_mask.shape
     goal_num_agents = min(A, goal_num_agents)
     
     valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
@@ -53,11 +53,12 @@ def select_debug_batch(dataloader, seed=None):
     debug_batch = next(iter(dataloader))
 
     obs_mask = debug_batch['obs_mask']
+    targets_mask = debug_batch['targets_mask']
     goal_num_agents = 4
     goal_num_samples = 5
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
-    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples)
+    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples)
     assert valid_batch_idxs is not None
 
     return debug_batch, 0, valid_agent_idxs, valid_batch_idxs
@@ -157,6 +158,7 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
     obs_mask = batch["obs_mask"].to(device)
     targets = batch["targets"].to(device)
     targets_mask = batch.get("targets_mask", None)
+    targets_idx = batch.get("targets_idx", None).to(device)
     if targets_mask is None:
         targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
     else:
@@ -169,6 +171,7 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
         "obs_mask": obs_mask,
         "targets": targets,
         "targets_mask": targets_mask,
+        "targets_idx": targets_idx,
     }
 
     with torch.device("cuda"):
@@ -238,6 +241,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
     obs_mask = batch["obs_mask"].to(device)
     targets = batch["targets"].to(device)
     targets_mask = batch.get("targets_mask", None)
+    targets_idx = batch.get("targets_idx", None).to(device)
     if targets_mask is None:
         targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
     else:
@@ -251,7 +255,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
     goal_num_samples = min(goal_num_samples, B)
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
-    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, goal_num_agents, goal_num_samples)
+    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targetes_mask, goal_num_agents, goal_num_samples)
     if valid_batch_idxs is None:
         return
 
