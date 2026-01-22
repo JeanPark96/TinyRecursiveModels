@@ -14,13 +14,15 @@ def compute_metrics(pred, targets, targets_mask, only_full=False, history_mask=N
     out_slice: terminating index for positions
     miss_tol: tolerance for miss rate, assumed same units as pred and targets
     """
+    B, H, Ain = history_mask.shape
+    _, F, Aout = targets_mask.shape
     # update masking
     if only_full:
         assert history_mask is not None, "Must specify history mask if computing metrics on full tracks"
         if targets_mask.shape[2] != history_mask.shape[2]: assert targets_idx is not None, "Must specify target indices if predicting fewer output agents than input agents"
 
-        if targets_idx is not None:
-            history_mask = history_mask.gather(dim=2, index=targets_idx[:, None, :]) # [B, H, AF]
+        if targets_idx is not None and Aout < Ain:
+            history_mask = history_mask.gather(dim=2, index=targets_idx[:, None, :].expand(-1,H,-1)) # [B, H, AF]
         full_history = torch.all(history_mask, dim=1) # [B, AF]
         full_future = torch.all(targets_mask, dim=1) # [B, AF]
         full_track = full_history & full_future # [B, AF]

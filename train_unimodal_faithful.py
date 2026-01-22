@@ -36,7 +36,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -50,7 +50,7 @@ importlib.reload(trm_unimodal)
 #     TRM_ACT_NuScenes_Config
 # )
 importlib.reload(trm_unimodal)
-from models.recursive_reasoning.trm_unimodal_v2 import (
+from models.recursive_reasoning.trm_unimodal_v4 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -314,8 +314,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
             targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
-            targets_idx = batch["targets_idx"]
-            print(obs_pose.shape, obs_mask.shape, targets.shape, targets_mask.shape, targets_idx.shape)
+            targets_idx = batch.get("targets_idx", None).to(device)        # [B, Aout]
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -326,6 +325,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 "obs_mask": obs_mask,
                 "targets": targets,
                 "targets_mask": targets_mask,
+                "targets_idx": targets_idx,
             }
 
             metrics, outputs = train_batch(train_state, model_input)
@@ -335,14 +335,14 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             batch_targets_mask = train_state.carry.current_data['targets_mask'] # accommodate asynchronous deep supervision
             pred = outputs["pred"]
             ade, fde, _ = compute_metrics(
-                pred, batch_targets, batch_targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
+                pred, batch_targets, batch_targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
             targets_xy_denorm = (batch_targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
             ade_real, fde_real, mr = compute_metrics(
-                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
+                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             # log metrics
@@ -395,6 +395,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     obs_mask = batch["obs_mask"].to(device)
                     targets = batch["targets"].to(device)
                     targets_mask = batch.get("targets_mask", None)
+                    targets_idx = batch.get("targets_idx", None).to(device)
                     if targets_mask is None:
                         targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
                     else:
@@ -406,6 +407,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         "obs_mask": obs_mask,
                         "targets": targets,
                         "targets_mask": targets_mask,
+                        "targets_idx": targets_idx,
                     }
 
                     with torch.device("cuda"):
@@ -442,14 +444,14 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     # calc extra metrics
                     pred = outputs["pred"]
                     ade, fde, _ = compute_metrics(
-                        pred, targets, targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
+                        pred, targets, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
                     )
 
                     pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
                     targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
                     ade_real, fde_real, mr = compute_metrics(
-                        pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, out_slice=config_dict["out_slice"]
+                        pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
                     )
 
                     # log metrics
