@@ -35,7 +35,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v3 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -43,7 +43,13 @@ importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v2 import (
+
+# from models.recursive_reasoning.trm_unimodal_v2 import (
+#     TRM_ACT_NuScenes,
+#     TRM_ACT_NuScenes_Config
+# )
+importlib.reload(trm_unimodal)
+from models.recursive_reasoning.trm_unimodal_v3 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -553,16 +559,28 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 def load_dataset(args):
     
     print("Loading Dataset...")
-    
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/ood.npz'
+    split_dir = args.split_type
+    if args.bev:
+        split_dir = f'bev-{split_dir}'
+    if args.camera_FL or args.camera_FR or args.camera_B or args.camera_BL or args.camera_BR:
+        split_dir = f'cam-{split_dir}'
+
+    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/train.npz'
+    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/val.npz'
+    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/test.npz'
+    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{split_dir}/ood.npz'
     
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
+
+    camera = {'F':args.camera_F,
+              'FL':args.camera_FL,
+              'FR':args.camera_FR,
+              'B':args.camera_B,
+              'BL':args.camera_BL,
+              'BR':args.camera_BR}
     
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -570,11 +588,11 @@ def load_dataset(args):
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
     tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
@@ -590,7 +608,7 @@ def load_dataset(args):
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -620,7 +638,13 @@ if __name__ == "__main__":
                                              'object-bendy', 'object-ambulance', 'object-police'],)
     
     # modalities (always use pose data, but optionally add extra sensor data)
-    parser.add_argument("--camera", action="store_true", help="Use camera data.")
+    parser.add_argument("--camera_F", action="store_true", help="Use front camera data.")
+    parser.add_argument("--camera_FL", action="store_true", help="Use front left camera data.")
+    parser.add_argument("--camera_FR", action="store_true", help="Use front right camera data.")
+    parser.add_argument("--camera_B", action="store_true", help="Use back camera data.")
+    parser.add_argument("--camera_BL", action="store_true", help="Use back left camera data.")
+    parser.add_argument("--camera_BR", action="store_true", help="Use back right camera data.")
+    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
 

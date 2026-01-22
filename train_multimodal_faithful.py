@@ -241,6 +241,10 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
             "forward_dtype": "float32",
             "mlp_t": False,
+
+            "num_cameras": len(args.cam_names),         
+            "cam_names": args.cam_names 
+
         }
 
         with open(os.path.join("./config", f"{RUN_NAME}.json"), "w") as f:
@@ -339,6 +343,12 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 "obs_mask": obs_mask,
                 "targets": targets,
                 "targets_mask": targets_mask,
+                "camera_F_features": batch.get("camera_F_features", None).to(device),
+                "camera_FL_features": batch.get("camera_FL_features", None).to(device),
+                "camera_FR_features": batch.get("camera_FR_features", None).to(device),
+                "camera_B_features": batch.get("camera_B_features", None).to(device),
+                "camera_BL_features": batch.get("camera_BL_features", None).to(device),
+                "camera_BR_features": batch.get("camera_BR_features", None).to(device),
             }
 
             metrics, outputs = train_batch(train_state, model_input)
@@ -416,6 +426,12 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         "obs_mask": obs_mask,
                         "targets": targets,
                         "targets_mask": targets_mask,
+                        "camera_F_features": batch.get("camera_F_features", None).to(device),
+                        "camera_FL_features": batch.get("camera_FL_features", None).to(device),
+                        "camera_FR_features": batch.get("camera_FR_features", None).to(device),
+                        "camera_B_features": batch.get("camera_B_features", None).to(device),
+                        "camera_BL_features": batch.get("camera_BL_features", None).to(device),
+                        "camera_BR_features": batch.get("camera_BR_features", None).to(device),
                     }
 
                     with torch.device("cuda"):
@@ -555,23 +571,28 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
 def load_dataset(args):
     print("Loading Dataset...")
-        
-    
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/ood.npz'
-    
+    if args.use_camera:
+        if args.lidar:
+            args.split_dir = f'cam-bev-{args.split_type}'
+        else:
+            args.split_dir = f'cam-{args.split_type}'
+            filename_prefix = "all_camera_features"
+
+    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/train.npz'
+    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/val.npz'
+    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/test.npz'
+    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/ood.npz'
+
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
     
-    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
-    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
-    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
-    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
+    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_train.h5"
+    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_val.h5"
+    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_test.h5"
+    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_ood.h5"
 
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=train_vid_feat_path)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=train_vid_feat_path)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -579,16 +600,38 @@ def load_dataset(args):
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=val_vid_feat_path, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=val_vid_feat_path, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
-    print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=test_vid_feat_path, norm_stats=stats)
-    print(f'Loaded! {len(test_dataset)}')
-
-    tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
-    val_dataloader = DataLoader(val_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
+    # print(f'Loading test dataset...')
+    # test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=test_vid_feat_path, norm_stats=stats)
+    # print(f'Loaded! {len(test_dataset)}')
+    test_dataset = None
+    tr_dataloader = DataLoader(tr_dataset, 
+                                batch_size=args.config_batch_size, 
+                                shuffle=True, 
+                                collate_fn=custom_collate,  
+                                num_workers=4,
+                                pin_memory=True,
+                                persistent_workers=True,
+                                prefetch_factor=2, drop_last=True) # need to trop last for asynchronous deep supervision
+    val_dataloader = DataLoader(val_dataset, 
+                                batch_size=args.config_batch_size, 
+                                shuffle=False, 
+                                collate_fn=custom_collate,
+                                num_workers=4,
+                                pin_memory=True,
+                                persistent_workers=True,
+                                prefetch_factor=2)
+    test_dataloader = None
+    # test_dataloader = DataLoader(test_dataset,
+    #                             batch_size=args.config_batch_size, 
+    #                             shuffle=False, 
+    #                             collate_fn=custom_collate,
+    #                             num_workers=4,
+    #                             pin_memory=True,
+    #                             persistent_workers=True,
+    #                             prefetch_factor=2)
 
     pos_mean = stats["pos_mean"]
     pos_std  = stats["pos_std"]
@@ -598,17 +641,42 @@ def load_dataset(args):
     print("Denormalize params: ", mean_xy, std_xy)
 
     if 'standard' not in args.split_type:
-        print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=ood_vid_feat_path, norm_stats=stats)
-        print(f'Loaded ood dataset! {len(ood_dataset)}')
-        ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
+        # print(f'Loading ood dataset...')
+        # ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=ood_vid_feat_path, norm_stats=stats)
+        # print(f'Loaded ood dataset! {len(ood_dataset)}')
+        # ood_dataloader = DataLoader(ood_dataset, 
+        #                             batch_size=args.config_batch_size, 
+        #                             shuffle=False, 
+        #                             collate_fn=custom_collate,
+        #                             num_workers=4,
+        #                             pin_memory=True,
+        #                             persistent_workers=True,
+        #                             prefetch_factor=2)
+        ood_dataset = None
+        ood_dataloader = None
     else:
         ood_dataset = None
         ood_dataloader = None
 
+    #uncomment to check data type
+    # sample = tr_dataset[0]
+    # for k, v in sample.items():
+    #     if torch.is_tensor(v):
+    #         print(k, v.dtype, v.shape)
     return tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
 
 if __name__ == "__main__":
+    # CAMERA_NAMES = ["camera_F", "camera_FL", "camera_FR", "camera_B", "camera_BL", "camera_BR"]
+    CAMERA_NAMES = ["F", "FL", "FR", "B", "BL", "BR"]
+    # CAMERA_KEY_TO_NAME = {
+    #     "camera_F":  "F",
+    #     "camera_FL": "FL",
+    #     "camera_FR": "FR",
+    #     "camera_B": "B",   # note: BF → B
+    #     "camera_BL": "BL",
+    #     "camera_BR": "BR",
+    # }
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
     parser.add_argument("--epochs", type=int, default=10)
@@ -629,7 +697,7 @@ if __name__ == "__main__":
                                              'object-bendy', 'object-ambulance', 'object-police'],)
     
     # modalities (always use pose data, but optionally add extra sensor data)
-    parser.add_argument("--camera", action="store_true", help="Use camera data.")
+    parser.add_argument("--camera", action="append", choices=CAMERA_NAMES, default=[], help=f"Cameras to use {CAMERA_NAMES}")
     parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
@@ -645,6 +713,13 @@ if __name__ == "__main__":
     # update task parameters
     args.n_history = args.history_sec*SAMPLE_FREQ # current time inclusive
     args.n_horizon = args.horizon_sec*SAMPLE_FREQ
+
+    args.use_camera = {k: (k in args.camera) for k in CAMERA_NAMES}
+    # args.cam_names = [CAMERA_KEY_TO_NAME[k] for k in CAMERA_NAMES if args.use_camera[k]]
+    args.cam_names = [k for k in CAMERA_NAMES if args.use_camera[k]]
+    
+    print("Using cameras: ", args.use_camera)
+    print(args.cam_names)
 
     print(f"n_history: {args.n_history}, n_horizon: {args.n_horizon}")
 

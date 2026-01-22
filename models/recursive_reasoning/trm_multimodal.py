@@ -73,6 +73,9 @@ class TRM_ACT_NuScenes_Config(BaseModel):
     # --- Camera Config ---
     # --- Vision Config (No intrinsics needed!) ---
     use_camera: bool = True
+    num_cameras: int = 6          # NEW
+    cam_names: List[str] = ["F","FL","FR","B","BL","BR"]  # optional, for readability
+
     cam_in_channels: int = 3
     cam_feat_height: int = 9  # ResNet18 output size for 224x224 input
     cam_feat_width: int = 16
@@ -210,7 +213,10 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         self.embed_inputs = CastedLinear(self.config.in_dim, self.config.hidden_size, bias=True)
         self.embed_agent = CastedEmbedding(self.config.max_obstacles, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.embed_time = CastedEmbedding(self.config.n_history, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-
+        self.cam_to_id = {name: i for i, name in enumerate(self.config.cam_names)}
+        self.embed_cam = CastedEmbedding(len(self.config.cam_names), self.config.hidden_size,
+                                        init_std=embed_init_std, cast_to=self.forward_dtype)
+        
         gt = trunc_normal_init_(torch.empty(1, self.config.global_len, self.config.hidden_size, dtype=self.forward_dtype), std=1.0)
         self.global_token = nn.Parameter(gt)
 
@@ -237,7 +243,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)
 
-    def _prepare_inputs(self, obs_pose, obs_mask, camera_features):
+    def _prepare_inputs(self, obs_pose, obs_mask, batch):
         """
         Processes Kinematics and Images ONCE before recursion.
         Returns: 
@@ -267,45 +273,83 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         if self.config.pos_encodings == "learned":
             emb = 0.707106781 * (emb + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
-        # --- 2. Visual Context Preparation ---
         visual_context = None
-        if self.config.use_camera and camera_features is not None:
-            # camera_features: [B, T, C, H, W]
-            B, T, C, H, W = camera_features.shape
-            vis_feats = camera_features.view(B * T, C, H, W).to(self.forward_dtype)
-            
-            # Flatten Spatial & Transpose: [B*T, 512, H*W] -> [B*T, H*W, 512]
-            # Matches expectations of Linear layer (input dim last)
-            vis_feats_flat = vis_feats.flatten(2).transpose(1, 2)
-            
-            # Project & Flatten Spatial: [B*T, h*w, D]
-            vis_tokens = self.vis_proj(vis_feats_flat)
-            vis_tokens = self.vis_norm(vis_tokens)
-
-            vis_tokens = vis_tokens * self.embed_scale
-
-            # A. Add Spatial Embeddings (Where in the image?)
-            vis_tokens = vis_tokens + self.vis_pos_emb
-            
-            # B. Add Temporal Embeddings (Which time step?)
-            # Reshape back to [B, T, h*w, D]
-            num_patches = vis_tokens.shape[1]
-            vis_tokens = vis_tokens.view(B, T, num_patches, self.config.hidden_size)
-            
-            # Broadcast time embeddings: [1, T, 1, D]
-            t_emb = self.embed_time(time_ids).view(1, T, 1, self.config.hidden_size)
-            vis_tokens = vis_tokens + t_emb
-            
-            # Flatten to single visual sequence per batch: [B, T*h*w, D]
-            vis_tokens = vis_tokens.view(B, T * num_patches, self.config.hidden_size)
-            
-            # C. Add Null/Global Token
-            # Allows attending to "nothing" or "global scene"
-            null_tok = self.visual_null_token.expand(B, 1, -1)
-            visual_context = torch.cat([null_tok, vis_tokens], dim=1) # [B, T*H*W+1, D]
-
+        if batch is not None:
+            #print("batch is not None")
+            visual_context = self._prepare_visual_context_from_batch(batch, T=T, device=obs_pose.device)
         return self.embed_scale * emb, full_mask, visual_context
-   
+    
+    def _prepare_visual_context_from_batch(self, batch: Dict[str, torch.Tensor], T: int, device) -> Optional[torch.Tensor]:
+        # Collect selected cameras from batch
+        #selected = getattr(self.config, "use_cameras", ["F"])
+        #print(selected)
+        cam_names = getattr(self.config, "cam_names", ["F","FL","FR","B","BL","BR"])
+        #print(cam_names, batch.keys())
+        vis_seqs = []
+        for cam in cam_names:
+            key = f"camera_{cam}_features"  # you already have these keys
+            if key not in batch:
+                #print("does not exist")
+                continue
+
+            feats = batch[key]  # expected [B, T, 512, 9, 16] (precomputed)
+            B, T2, C, H, W = feats.shape
+            assert T2 == T, f"{key} has T={T2}, expected {T}"
+
+            feats = feats.to(self.forward_dtype)
+
+            # [B*T, 512, H, W]
+            feats = feats.view(B * T, C, H, W)
+
+            # [B*T, H*W, 512]
+            feats_flat = feats.flatten(2).transpose(1, 2)
+
+            # [B*T, H*W, D]
+            tokens = self.vis_proj(feats_flat)
+            tokens = self.vis_norm(tokens)
+            tokens = tokens * self.embed_scale
+
+            # spatial emb: [1, HW, D]
+            tokens = tokens + self.vis_pos_emb
+
+            # reshape for time/cam embedding: [B, T, HW, D]
+            HW = tokens.shape[1]
+            tokens = tokens.view(B, T, HW, self.config.hidden_size)
+
+            # add temporal embedding: [1, T, 1, D]
+            time_ids = torch.arange(T, device=device)
+            tokens = tokens + self.embed_time(time_ids).view(1, T, 1, self.config.hidden_size)
+
+            # add camera-id embedding: [1, 1, 1, D]
+            cam_id = torch.tensor([self.cam_to_id[cam]], device=device)
+            tokens = tokens + self.embed_cam(cam_id).view(1, 1, 1, self.config.hidden_size)
+
+            # flatten: [B, T*HW, D]
+            tokens = tokens.view(B, T * HW, self.config.hidden_size)
+
+            vis_seqs.append(tokens)
+
+        if len(vis_seqs) == 0:
+            #print("Return None")
+            return None
+
+        # concat cameras along sequence dimension: [B, sum_cam(T*HW), D]
+        vis_tokens = torch.cat(vis_seqs, dim=1)
+        expected_len = self.config.num_cameras * T * HW
+        _, loc_seq_len, _ = vis_tokens.shape
+        #print("length", expected_len)
+
+        assert loc_seq_len == expected_len, (
+        f"[Vision ERROR] visual token length mismatch: "
+        f"got seq_len={loc_seq_len}, expected={expected_len} "
+        f"(cams={len(vis_seqs)}, T={T}, HW={HW})."
+        )
+
+        # add null token at front
+        B = vis_tokens.shape[0]
+        null_tok = self.visual_null_token.expand(B, 1, -1)
+        return torch.cat([null_tok, vis_tokens], dim=1)
+    
     def empty_carry(self, batch_size: int, device: torch.device) -> TRM_ACT_NuScenes_InnerCarry:
         total_len = self.config.global_len + self.seq_len
         return TRM_ACT_NuScenes_InnerCarry(
@@ -332,14 +376,17 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         # Precompute Inputs (and Vision) only if cache is empty
         # In ACT, batch data stays same, so we reuse visual_context
         if visual_context_cache is None:
+            #print("visual conext none")
             input_embeddings, full_mask, visual_context = self._prepare_inputs(
-                batch["obs_pose"], 
+                batch["obs_pose"],
                 batch["obs_mask"],
-                batch.get("camera_features")
+                batch
             )
+            
         else:
             # Re-compute only agent embeddings if needed (but usually constant in ACT step)
             # For simplicity here we re-run prepare but should optimize in prod
+            #print("visual context cached")
             input_embeddings, full_mask, _ = self._prepare_inputs(batch["obs_pose"], batch["obs_mask"], None)
             visual_context = visual_context_cache
         seq_info = dict(
@@ -393,7 +440,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
 
         last_step_mask = batch["obs_mask"][:, -1].to(torch.bool)
         pred = pred * last_step_mask[:, :, None, None].to(pred.dtype)
-
+        visual_context = visual_context.detach() if visual_context is not None else None
         return new_carry, pred, (q_logits[..., 0], q_logits[..., 1]), global_latent, visual_context
 
 # =========================
@@ -427,17 +474,25 @@ class TRM_ACT_NuScenes(nn.Module):
             carry.prev_loss,
         )
 
-        new_current_data = {}
-        for k, v in carry.current_data.items():
-            if k in batch and isinstance(batch[k], torch.Tensor) and isinstance(v, torch.Tensor):
-                dims_needed = batch[k].ndim - 1
-                mask_expanded = carry.halted.view((-1,) + (1,) * dims_needed)
-                new_current_data[k] = torch.where(mask_expanded, batch[k], v)
-            else:
-                new_current_data[k] = batch[k]
+        # new_current_data = {}
+        # for k, v in carry.current_data.items():
+        #     if k in batch and isinstance(batch[k], torch.Tensor) and isinstance(v, torch.Tensor):
+        #         dims_needed = batch[k].ndim - 1
+        #         mask_expanded = carry.halted.view((-1,) + (1,) * dims_needed)
+        #         new_current_data[k] = torch.where(mask_expanded, batch[k], v)
+        #     else:
+        #         new_current_data[k] = batch[k]
+        new_current_data = {
+            k: torch.where(
+                carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)),
+                batch[k],
+                v,
+            )
+            for k, v in carry.current_data.items()
+        }
 
         new_inner_carry, pred, (q_halt, q_cont), global_latent, vis_ctx = self.inner(new_inner_carry, new_current_data, carry.visual_context)
-
+        
         outputs = {"pred": pred, "global_latent": global_latent, "q_halt_logits": q_halt, "q_continue_logits": q_cont}
         
         with torch.no_grad():
@@ -453,6 +508,7 @@ class TRM_ACT_NuScenes(nn.Module):
                      explore = (torch.rand_like(q_halt) < self.config.halt_exploration_prob)
                      min_halt = torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
                      halted = halted & (new_steps >= torch.where(explore, min_halt, torch.zeros_like(min_halt)))
-
+        if vis_ctx is not None:
+            vis_ctx = vis_ctx.detach()
         new_carry = TRM_ACT_NuScenes_Carry(new_inner_carry, new_steps, halted, new_current_data, new_prev_loss, vis_ctx)
         return new_carry, outputs
