@@ -64,7 +64,7 @@ def select_debug_batch(dataloader, seed=None):
     return debug_batch, 0, valid_agent_idxs, valid_batch_idxs
 
 # plot for only one object in one sample
-def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_masks, obs_types, title="Trajectories", RUN_NAME="model", filename = "model_default"):
+def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_masks, obs_types, title="Trajectories", RUN_NAME="model", filename = "model_default", sub_name="run"):
     """
     hist_traj: [History, AgentsToPlot, 2]
     pred_traj: [AgentsToPlot, Future, 2]
@@ -135,9 +135,9 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
     plt.legend()
     plt.axis('equal')
     plt.grid(True)
-    save_path = f'plot_figures/{RUN_NAME}/{filename}.png'
+    save_path = f'plot_figures/{RUN_NAME}/{sub_name}/{filename}.png'
 
-    os.makedirs(f"plot_figures/{RUN_NAME}", exist_ok=True)
+    os.makedirs(f"plot_figures/{RUN_NAME}/{sub_name}", exist_ok=True)
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     # print(f"Plot saved to: {save_path}")
     plt.close()
@@ -145,7 +145,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
     #plt.show()
 
 @torch.no_grad()
-def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, device, epoch, run_name, out_slice, together=True):
+def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, device, epoch, run_name, out_slice, together=True, sub_name='run'):
     """
     Run the model on a fixed batch and plot the first few agents' trajectories.
     Called before training/resume (with the current model state) and after each epoch.
@@ -209,6 +209,7 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                 title=f"[Debug] epoch {epoch} sample {s}",
                 RUN_NAME=run_name,
                 filename=f"{run_name}_debug_epoch{epoch}_sample{s}",
+                sub_name=sub_name
             )
     else:
         for s in rdm_samples:
@@ -230,10 +231,11 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                     title=f"[Debug] agent {a} @ epoch {epoch} sample {s}",
                     RUN_NAME=run_name,
                     filename=f"{run_name}_debug_epoch{epoch}_sample{s}_agent{a}",
+                    sub_name=sub_name,
                 )
 
 @torch.no_grad()
-def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_slice, goal_num_agents=8, goal_num_samples=5, together=True):
+def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_slice, goal_num_agents=8, goal_num_samples=5, together=True, sub_name='run'):
     """
     together: plot all agents on top of each other if true
     """
@@ -278,6 +280,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
                 title=f"[Test] batch {batch_num} sample {s}",
                 RUN_NAME=run_name,
                 filename=f"{run_name}_test_batch_{batch_num}_sample{s}",
+                sub_name=sub_name,
             )
     else:
         for s in valid_batch_idxs:
@@ -299,4 +302,5 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
                     title=f"[Test] agent {a} @ batch {batch_num} sample {s}",
                     RUN_NAME=run_name,
                     filename=f"{run_name}_test_batch{batch_num}_sample{s}_agent{a}",
+                    sub_name=sub_name,
                 )

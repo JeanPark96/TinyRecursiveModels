@@ -244,8 +244,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         )
     
     # Set up tensorboard
-    datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
-    tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{datetimestr}'))
+    if args.tboard_name is None:
+        datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+        tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{datetimestr}'))
+    else:
+        tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{args.tboard_name}'))
 
     # --- Model & optimizer ---
     logger.log("Initializing Model...")
@@ -289,7 +292,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         device,
         epoch=start_epoch,
         run_name=f'debug_{RUN_NAME}_val',
-        out_slice=config_dict["out_slice"]
+        out_slice=config_dict["out_slice"],
+        sub_name=args.tboard_name,
     )
 
     # Training Loop
@@ -525,6 +529,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     epoch=epoch+1,
                     run_name=f'debug_{RUN_NAME}_val',
                     out_slice=config_dict["out_slice"],
+                    sub_name=args.tboard_name,
                 )
 
                 if ood_dataloader is not None:
@@ -538,6 +543,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         epoch=epoch+1,
                         run_name=f'debug_{RUN_NAME}_ood',
                         out_slice=config_dict["out_slice"],
+                        sub_name=args.tboard_name,
                     )
 
 
@@ -551,6 +557,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
+    parser.add_argument("--tboard_name", type=str, help="Name for tensorboard run")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_schedule", action="store_true", help="Use learning rate scheduler")
