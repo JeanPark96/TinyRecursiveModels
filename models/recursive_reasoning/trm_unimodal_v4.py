@@ -8,8 +8,8 @@ from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
 from models.layers import (
-    rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin,
-    CastedEmbedding, CastedLinear
+    rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, Attention_Mask,
+    CastedEmbedding, CastedLinear, SinusoidalPositionEmbeddings
 )
 
 '''
@@ -17,6 +17,9 @@ V4 is ased off of V2.
 V3, which primarily added add/norm in the decoder block, is skipped due to poor performance.
 Major changes in this version:
     Allow number of output agents to be less than number of input agents
+    Incorporate target idx in decoding process
+    Remove agent ID encoding and use SPE-based time encoding
+    Incorporate history mask as attention mask
 '''
 
 # =========================
@@ -69,6 +72,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
 
     # transformer config
     hidden_size: int
+    time_dim: int = 16
     expansion: float
     num_heads: int
     pos_encodings: str          # "rope" | "learned" | "none"
@@ -97,7 +101,7 @@ class TRM_ACT_NuScenes_Block(nn.Module):
         if self.config.mlp_t:
             self.mlp_t = SwiGLU(hidden_size=self.config.seq_len, expansion=config.expansion)
         else:
-            self.self_attn = Attention(
+            self.self_attn = Attention_Mask(
                 hidden_size=config.hidden_size,
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
@@ -119,8 +123,9 @@ class TRM_ACT_NuScenes_Block(nn.Module):
             hs = rms_norm(hs + out, variance_epsilon=self.norm_eps)
             hidden_states = hs.transpose(1, 2)
         else:
+            attn_mask = token_mask[:,None,None,:].expand(-1,1,hidden_states.size(1),-1) # [B, 1, L, L]
             hidden_states = rms_norm(
-                hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states),
+                hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attention_mask=attn_mask),
                 variance_epsilon=self.norm_eps,
             )
 
@@ -167,12 +172,12 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         # Continuous input projection
         self.embed_inputs = CastedLinear(self.config.in_dim, self.config.hidden_size, bias=True)
 
-        # Agent & time embeddings
-        self.embed_agent = CastedEmbedding(
-            self.config.max_obstacles, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
-        )
-        self.embed_time = CastedEmbedding(
-            self.config.n_history, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype
+        # Time embedding
+        self.embed_time = nn.Sequential(
+            SinusoidalPositionEmbeddings(self.config.time_dim),
+            CastedLinear(self.config.time_dim, self.config.hidden_size, bias=True),
+            nn.GELU(),
+            CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=True),
         )
 
         # Global token (learned)
@@ -243,9 +248,8 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         emb = self.embed_inputs(x)  # [B, T, A, D]
 
         # Add time/agent embeddings (broadcast)
-        time_ids = torch.arange(T, device=obs_pose.device)
-        agent_ids = torch.arange(A, device=obs_pose.device)
-        emb = emb + self.embed_time(time_ids)[None, :, None, :] + self.embed_agent(agent_ids)[None, None, :, :]
+        time_ids = torch.arange(T, device=obs_pose.device) / T
+        emb = emb + self.embed_time(time_ids)[None, :, None, :]
 
         # Flatten to [B, A*T, D] with token index = agent*T + t
         emb = emb.permute(0, 2, 1, 3).contiguous().view(B, A * T, self.config.hidden_size)
@@ -327,23 +331,32 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_obs = self.config.n_history
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
+        targets_idx = batch["targets_idx"]
 
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
         agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
 
         # 2. Reshape to independent sequences: [B, Aout*T_obs, D]
         #    This groups all history for a specific agent together.
-        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D).view(B, A * T_obs, D)
+        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D)
+        if Aout < A:
+            history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
+            history_kv = history_kv.view(B, Aout * T_obs, D)
+        else:
+            history_kv = history_kv.view(B, A * T_obs, D)
 
         # 3. Expand future queries: [B, Aout*T_pred, D]
         queries = self.future_queries.expand(B, Aout, -1, -1).reshape(B, Aout * T_pred, D)
 
         # 4. Cross Attention: Future queries attend to history
         #    attn_out: [B, Aout*T_pred, D]
+        key_padding_mask = batch["obs_mask"].gather(dim=2, index=targets_idx[:,None,:].expand(-1,T_obs,-1))
+        key_padding_mask = ~key_padding_mask.to(torch.bool).permute(0,2,1).contiguous().view(B, Aout*T_obs)
         attn_out, _ = self.decoder_attn(
             query=queries,
             key=history_kv,
-            value=history_kv
+            value=history_kv,
+            key_padding_mask=key_padding_mask,
         )
 
         # 5. Project to output dim: [B, Aout*T_pred, out_dim]
@@ -353,8 +366,6 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         pred = pred_flat.view(B, Aout, T_pred, self.config.out_dim)
 
         # =================================================================
-
-        targets_idx = batch["targets_idx"]
 
         # delta decoding for first out_slice dims
         if self.config.predict_delta and self.config.out_slice > 0:

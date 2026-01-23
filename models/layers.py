@@ -3,6 +3,7 @@ import einops
 import torch
 from torch import nn
 import torch.nn.functional as F
+import math
 
 #try:
 #    from flash_attn_interface import flash_attn_func  # type: ignore[import]
@@ -216,3 +217,17 @@ class Attention_Mask(nn.Module):
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings

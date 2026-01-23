@@ -1,0 +1,6 @@
+*__pycache__*
+config
+checkpoints
+logs
+plot_figures
+tboard
