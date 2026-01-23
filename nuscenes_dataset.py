@@ -168,7 +168,7 @@ def custom_collate(batch):
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, use_preprocessed=False, feature_path=None, norm_stats=True):      
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, use_preprocessed=False, feature_path=None, norm_stats=None):      
         self.use_camera_F = use_camera['F']
         self.use_camera_FL = use_camera['FL']
         self.use_camera_FR = use_camera['FR']

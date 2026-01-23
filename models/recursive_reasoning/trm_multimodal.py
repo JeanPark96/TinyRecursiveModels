@@ -40,6 +40,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
     batch_size: int
     n_history: int
     max_obstacles: int
+    max_predict: int            # Aout
     n_horizon: int
 
     in_dim: int = 7
@@ -191,6 +192,8 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
         self.seq_len = self.config.max_obstacles * self.config.n_history
+        self.global_len = self.config.global_len
+        self.config.seq_len = self.seq_len  # for parity
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
@@ -277,7 +280,11 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         if batch is not None:
             #print("batch is not None")
             visual_context = self._prepare_visual_context_from_batch(batch, T=T, device=obs_pose.device)
-        return self.embed_scale * emb, full_mask, visual_context
+        
+        # last observed pose per agent for delta decoding
+        last_obs = obs_pose[:, -1].to(self.forward_dtype)  # [B, A, 7]
+
+        return self.embed_scale * emb, full_mask, visual_context, last_obs
     
     def _prepare_visual_context_from_batch(self, batch: Dict[str, torch.Tensor], T: int, device) -> Optional[torch.Tensor]:
         # Collect selected cameras from batch
@@ -377,7 +384,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         # In ACT, batch data stays same, so we reuse visual_context
         if visual_context_cache is None:
             #print("visual conext none")
-            input_embeddings, full_mask, visual_context = self._prepare_inputs(
+            input_embeddings, full_mask, visual_context, last_obs = self._prepare_inputs(
                 batch["obs_pose"],
                 batch["obs_mask"],
                 batch
@@ -387,7 +394,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             # Re-compute only agent embeddings if needed (but usually constant in ACT step)
             # For simplicity here we re-run prepare but should optimize in prod
             #print("visual context cached")
-            input_embeddings, full_mask, _ = self._prepare_inputs(batch["obs_pose"], batch["obs_mask"], None)
+            input_embeddings, full_mask, _, last_obs = self._prepare_inputs(batch["obs_pose"], batch["obs_mask"], None)
             visual_context = visual_context_cache
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
@@ -422,27 +429,57 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         
         # Decoding
         global_latent = z_H[:, 0]
+        # Q head on global token
         q_logits = self.q_head(global_latent).to(torch.float32)
+        q_halt_logits, q_continue_logits = q_logits[..., 0], q_logits[..., 1]
         
-        B, A, T_obs, D = z_H.shape[0], self.config.max_obstacles, self.config.n_history, self.config.hidden_size
-        agent_tokens = z_H[:, self.config.global_len:]
-        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D).view(B * A, T_obs, D)
-        queries = self.future_queries.squeeze(0).expand(B * A, -1, -1)
+        B = z_H.shape[0]
+        A = self.config.max_obstacles
+        Aout = self.config.max_predict
+        T_obs = self.config.n_history
+        T_pred = self.config.n_horizon
+        D = self.config.hidden_size
         
-        attn_out, _ = self.decoder_attn(query=queries, key=history_kv, value=history_kv)
-        pred = self.output_proj(attn_out).view(B, A, self.config.n_horizon, self.config.out_dim)
+        # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
+        agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
 
+        # 2. Reshape to independent sequences: [B, Aout*T_obs, D]
+        #    This groups all history for a specific agent together.
+        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D).view(B, A * T_obs, D)
+
+        # 3. Expand future queries: [B, Aout*T_pred, D]
+        queries = self.future_queries.expand(B, Aout, -1, -1).reshape(B, Aout * T_pred, D)
+
+        # 4. Cross Attention: Future queries attend to history
+        #    attn_out: [B, Aout*T_pred, D]
+        attn_out, _ = self.decoder_attn(
+            query=queries,
+            key=history_kv,
+            value=history_kv
+        )
+
+        # 5. Project to output dim: [B, Aout*T_pred, out_dim]
+        pred_flat = self.output_proj(attn_out)
+
+        # 6. Reshape back to batch format: [B, A, T_pred, out_dim]
+        pred = pred_flat.view(B, Aout, T_pred, self.config.out_dim)
+
+        # =================================================================
+
+        targets_idx = batch["targets_idx"]
+
+        # delta decoding for first out_slice dims
         if self.config.predict_delta and self.config.out_slice > 0:
-            last_obs = batch["obs_pose"][:, -1].to(self.forward_dtype)
-            base = last_obs[:, :, : self.config.out_slice].to(pred.dtype)
-            pred_slice = pred[..., : self.config.out_slice]
+            last_obs_out = torch.gather(last_obs, 1, targets_idx[:,:,None].expand(-1,-1,last_obs.size(2))) # [B, Aout, 7]
+            base = last_obs_out[:, :, :self.config.out_slice].to(pred.dtype)  # [B, A, out_slice]
+            pred_slice = pred[..., :self.config.out_slice]
             pred = torch.cat([base[:, :, None, :] + pred_slice, pred[..., self.config.out_slice :]], dim=-1)
 
-        last_step_mask = batch["obs_mask"][:, -1].to(torch.bool)
+        # zero-out agents that don't exist at last obs step
+        last_step_mask = torch.gather(batch["obs_mask"][:, -1], 1, targets_idx).to(torch.bool)  # [B, Aout]
         pred = pred * last_step_mask[:, :, None, None].to(pred.dtype)
-        visual_context = visual_context.detach() if visual_context is not None else None
-        return new_carry, pred, (q_logits[..., 0], q_logits[..., 1]), global_latent, visual_context
 
+        return new_carry, pred, (q_halt_logits, q_continue_logits), global_latent, visual_context
 # =========================
 # ACT Wrapper (Standard)
 # =========================
@@ -474,14 +511,6 @@ class TRM_ACT_NuScenes(nn.Module):
             carry.prev_loss,
         )
 
-        # new_current_data = {}
-        # for k, v in carry.current_data.items():
-        #     if k in batch and isinstance(batch[k], torch.Tensor) and isinstance(v, torch.Tensor):
-        #         dims_needed = batch[k].ndim - 1
-        #         mask_expanded = carry.halted.view((-1,) + (1,) * dims_needed)
-        #         new_current_data[k] = torch.where(mask_expanded, batch[k], v)
-        #     else:
-        #         new_current_data[k] = batch[k]
         new_current_data = {
             k: torch.where(
                 carry.halted.view((-1,) + (1,) * (batch[k].ndim - 1)),

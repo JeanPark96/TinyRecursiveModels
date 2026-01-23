@@ -28,6 +28,7 @@ from nuscenes_dataset import NuScenesDataset, custom_collate
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
+from utils.metrics import compute_metrics
 from models.losses import ACTLossHeadNuScenes
 import random
 import numpy as np
@@ -97,25 +98,6 @@ def compute_lr(base_lr: float, train_state: TrainState):
         min_ratio=train_state.optimizer_lr_min_ratio
     )
 
-@torch.no_grad()
-def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
-    """
-    Returns scalar ADE/FDE (averaged over valid agents+timesteps).
-    """
-    tgt = targets[..., :out_slice].permute(0, 2, 1, 3).contiguous()         # [B,A,H,2]
-    m = targets_mask.permute(0, 2, 1).to(pred.dtype).contiguous()           # [B,A,H]
-
-    pred_xy = pred[..., :out_slice]
-    dist = torch.linalg.norm(pred_xy - tgt, dim=-1)                         # [B,A,H]
-
-    ade = (dist * m).sum() / (m.sum() + 1e-6)
-
-    # FDE: last horizon step only
-    dist_last = dist[:, :, -1]
-    m_last = m[:, :, -1]
-    fde = (dist_last * m_last).sum() / (m_last.sum() + 1e-6)
-
-    return ade.item(), fde.item()
 
 def train_batch(train_state: TrainState, batch: Any):
     train_state.step += 1
@@ -216,6 +198,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "batch_size": args.config_batch_size,  # logical batch size; dataloader can differ
             "n_history": args.n_history,
             "max_obstacles": args.max_obstacles,
+            "max_predict": args.max_predict,
             "n_horizon": args.n_horizon,
 
             "in_dim": 7,
@@ -321,18 +304,20 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         train_state.model.train()
 
         # step-wise stats
-        running_loss = running_ade = running_fde = running_ade_real = running_fde_real = 0.0
+        running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
         running_count = 0
 
         # epoch-wise stats
-        tr_ade_sum = tr_fde_sum = tr_ade_real_sum = tr_fde_real_sum = tr_loss_sum = 0.0
+        tr_ade_sum = tr_fde_sum = tr_ade_real_sum = tr_fde_real_sum = tr_loss_sum = tr_mr_sum= 0.0
         tr_n = 0
 
         for batch_idx, batch in enumerate(tr_dataloader):
             obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
-            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]        
+            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]  
+            targets_idx = batch.get("targets_idx", None).to(device)
+    
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -343,6 +328,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 "obs_mask": obs_mask,
                 "targets": targets,
                 "targets_mask": targets_mask,
+                "targets_idx": targets_idx,
                 "camera_F_features": batch.get("camera_F_features", None).to(device),
                 "camera_FL_features": batch.get("camera_FL_features", None).to(device),
                 "camera_FR_features": batch.get("camera_FR_features", None).to(device),
@@ -357,15 +343,15 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             batch_targets = train_state.carry.current_data['targets'] # accommodate asynchronous deep supervision
             batch_targets_mask = train_state.carry.current_data['targets_mask'] # accommodate asynchronous deep supervision
             pred = outputs["pred"]
-            ade, fde = compute_ade_fde(
-                pred, batch_targets, batch_targets_mask, out_slice=config_dict["out_slice"]
+            ade, fde, _ = compute_metrics(
+                pred, batch_targets, batch_targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
             targets_xy_denorm = (batch_targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-            ade_real, fde_real = compute_ade_fde(
-                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, out_slice=config_dict["out_slice"]
+            ade_real, fde_real, mr = compute_metrics(
+                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             # log metrics
@@ -373,6 +359,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             running_fde += fde
             running_ade_real += ade_real
             running_fde_real += fde_real
+            running_mr += mr
             running_loss += metrics['train/loss']
             running_count += 1
             if train_state.step % 50 == 0:
@@ -382,15 +369,17 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     f"ADE: {running_ade/running_count:.4f} | "
                     f"FDE: {running_fde/running_count:.4f} | "
                     f"ADE_real: {running_ade_real/running_count:.4f} | "
-                    f"FDE_real: {running_fde_real/running_count:.4f}" 
+                    f"FDE_real: {running_fde_real/running_count:.4f} | " 
+                    f"Miss_rate: {running_mr/running_count:.2f}"
                 )
-                running_loss = running_ade = running_fde = running_ade_real = running_fde_real = 0.0
+                running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
                 running_count = 0
 
             tr_ade_sum += ade
             tr_fde_sum += fde
             tr_ade_real_sum += ade_real
             tr_fde_real_sum += fde_real
+            tr_mr_sum += mr
             tr_loss_sum += metrics['train/loss']
             tr_n += 1
 
@@ -400,13 +389,14 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         tbd_writer.add_scalar(f"FDE/train", tr_fde_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"ADE_real/train", tr_ade_real_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"FDE_real/train", tr_fde_real_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"Miss_rate/train", tr_mr_sum / max(tr_n, 1), epoch+1)
 
 
         ############ Evaluation
         if epoch % args.eval_every_n_epochs == 0:
             logger.log(f"Running Validation...Epoch {epoch}")
             train_state.model.eval()
-            val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = 0.0
+            val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = val_mr_sum = 0.0
             val_n = 0
 
             with torch.no_grad():
@@ -415,6 +405,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     obs_mask = batch["obs_mask"].to(device)
                     targets = batch["targets"].to(device)
                     targets_mask = batch.get("targets_mask", None)
+                    targets_idx = batch.get("targets_idx", None).to(device)
+
                     if targets_mask is None:
                         targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
                     else:
@@ -426,6 +418,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         "obs_mask": obs_mask,
                         "targets": targets,
                         "targets_mask": targets_mask,
+                        "targets_idx": targets_idx,
                         "camera_F_features": batch.get("camera_F_features", None).to(device),
                         "camera_FL_features": batch.get("camera_FL_features", None).to(device),
                         "camera_FR_features": batch.get("camera_FR_features", None).to(device),
@@ -467,15 +460,15 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                             
                     # calc extra metrics
                     pred = outputs["pred"]
-                    ade, fde = compute_ade_fde(
-                        pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+                    ade, fde, _ = compute_metrics(
+                        pred, targets, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
                     )
 
                     pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
                     targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-                    ade_real, fde_real = compute_ade_fde(
-                        pred_xy_denorm, targets_xy_denorm, targets_mask, out_slice=config_dict["out_slice"]
+                    ade_real, fde_real, mr = compute_metrics(
+                        pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
                     )
 
                     # log metrics
@@ -483,6 +476,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     val_fde_sum += fde
                     val_ade_real_sum += ade_real
                     val_fde_real_sum += fde_real
+                    val_mr_sum += mr
                     val_loss_sum += reduced_metrics['val/loss']
                     val_n += 1
 
@@ -490,6 +484,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             val_fde = val_fde_sum / max(val_n, 1)
             val_ade_real = val_ade_real_sum / max(val_n, 1)
             val_fde_real = val_fde_real_sum / max(val_n, 1)
+            val_mr = val_mr_sum / max(val_n, 1)
             val_loss = val_loss_sum / max(val_n, 1)
 
             logger.log(
@@ -498,7 +493,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 f"ADE: {val_ade:.4f} | "
                 f"FDE: {val_fde:.4f} | "
                 f"Real ADE: {val_ade_real:.4f} | "
-                f"Real FDE: {val_fde_real:.4f}"
+                f"Real FDE: {val_fde_real:.4f} | "
+                f"Miss rate: {val_mr:.2f}"
             )
 
             # tensorboard logging
@@ -507,6 +503,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             tbd_writer.add_scalar(f"FDE/val",val_fde,epoch+1)
             tbd_writer.add_scalar(f"ADE_real/val",val_ade_real,epoch+1)
             tbd_writer.add_scalar(f"FDE_real/val",val_fde_real,epoch+1)
+            tbd_writer.add_scalar(f"Miss_rate/val",val_mr,epoch+1)
                 
             ############ Checkpointing
             epoch_ckpt_path = os.path.join(run_ckpt_dir, f"epoch_{epoch+1}.pth")
@@ -519,6 +516,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 "val_loss": val_loss,
                 "val_ade": val_ade,
                 "val_fde": val_fde,
+                "val_mr": val_mr,
                 "best_val_loss": best_val_loss,
             }
             torch.save(ckpt_payload, epoch_ckpt_path)
@@ -592,7 +590,14 @@ def load_dataset(args):
 
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=train_vid_feat_path)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history,
+                                  args.n_horizon, args.max_obstacles, 
+                                  args.max_predict, args.dynamic_only,
+                                  use_camera=args.use_camera, 
+                                  use_lidar=args.lidar, use_bev=args.bev, 
+                                  use_map=args.map,
+                                  use_preprocessed=args.preprocessed_vid_fea, 
+                                  feature_path=train_vid_feat_path)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -600,7 +605,12 @@ def load_dataset(args):
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=val_vid_feat_path, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, 
+                                  args.max_obstacles, args.max_predict, args.dynamic_only,
+                                  use_camera=args.use_camera, use_lidar=args.lidar, 
+                                  use_bev=args.bev, use_map=args.map,
+                                  use_preprocessed=args.preprocessed_vid_fea, 
+                                  feature_path=val_vid_feat_path, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     # print(f'Loading test dataset...')
@@ -701,12 +711,15 @@ if __name__ == "__main__":
     parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+    parser.add_argument('--map', action='store_true', help='Add map context.')
 
     # task parameters (non-defaults are used for sanity checking and testing)
     parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
     parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
     parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
     parser.add_argument("--eval_every_n_epochs", type=int, default=10, help='Save eval time by running validation every N epochs')
+    parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
+    parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
 
     args = parser.parse_args()
 
