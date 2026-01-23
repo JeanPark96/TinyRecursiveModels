@@ -332,6 +332,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
         targets_idx = batch["targets_idx"]
+        assert Aout <= A
 
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
         agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
@@ -341,22 +342,20 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         history_kv = agent_tokens.contiguous().view(B, A, T_obs, D)
         if Aout < A:
             history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
-            history_kv = history_kv.view(B, Aout * T_obs, D)
-        else:
-            history_kv = history_kv.view(B, A * T_obs, D)
+        history_kv = history_kv.view(B * Aout, T_obs, D)
 
         # 3. Expand future queries: [B, Aout*T_pred, D]
-        queries = self.future_queries.expand(B, Aout, -1, -1).reshape(B, Aout * T_pred, D)
+        queries = self.future_queries.expand(B * Aout, -1, -1, -1).reshape(B * Aout, T_pred, D)
 
         # 4. Cross Attention: Future queries attend to history
         #    attn_out: [B, Aout*T_pred, D]
-        key_padding_mask = batch["obs_mask"].gather(dim=2, index=targets_idx[:,None,:].expand(-1,T_obs,-1))
-        key_padding_mask = ~key_padding_mask.to(torch.bool).permute(0,2,1).contiguous().view(B, Aout*T_obs)
+        # key_padding_mask = batch["obs_mask"].gather(dim=2, index=targets_idx[:,None,:].expand(-1,T_obs,-1))
+        # key_padding_mask = ~key_padding_mask.to(torch.bool).permute(0,2,1).contiguous().view(B, Aout*T_obs)
         attn_out, _ = self.decoder_attn(
             query=queries,
             key=history_kv,
             value=history_kv,
-            key_padding_mask=key_padding_mask,
+            # key_padding_mask=key_padding_mask,
         )
 
         # 5. Project to output dim: [B, Aout*T_pred, out_dim]
@@ -369,13 +368,13 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
 
         # delta decoding for first out_slice dims
         if self.config.predict_delta and self.config.out_slice > 0:
-            last_obs_out = torch.gather(last_obs, 1, targets_idx[:,:,None].expand(-1,-1,last_obs.size(2))) # [B, Aout, 7]
+            last_obs_out = torch.gather(last_obs, dim=1, index=targets_idx[:,:,None].expand(-1,-1,last_obs.size(2))) # [B, Aout, 7]
             base = last_obs_out[:, :, :self.config.out_slice].to(pred.dtype)  # [B, A, out_slice]
             pred_slice = pred[..., :self.config.out_slice]
             pred = torch.cat([base[:, :, None, :] + pred_slice, pred[..., self.config.out_slice :]], dim=-1)
 
         # zero-out agents that don't exist at last obs step
-        last_step_mask = torch.gather(batch["obs_mask"][:, -1], 1, targets_idx).to(torch.bool)  # [B, Aout]
+        last_step_mask = torch.gather(batch["obs_mask"][:, -1], dim=1, index=targets_idx).to(torch.bool)  # [B, Aout]
         pred = pred * last_step_mask[:, :, None, None].to(pred.dtype)
 
         return new_carry, pred, (q_halt_logits, q_continue_logits), global_latent

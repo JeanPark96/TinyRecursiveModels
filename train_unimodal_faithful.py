@@ -386,6 +386,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         tbd_writer.add_scalar(f"ADE_real/train", tr_ade_real_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"FDE_real/train", tr_fde_real_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"Miss_rate/train", tr_mr_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar("Learning_rate", metrics['train/lr'], epoch+1)
 
         ############ Evaluation
         if epoch % 1 == 0:

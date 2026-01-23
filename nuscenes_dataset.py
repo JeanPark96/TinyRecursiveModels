@@ -164,11 +164,32 @@ def custom_collate(batch):
         collated['camera_BL_features'] = torch.stack([b['camera_BL_features'] for b in batch])
     if 'camera_BR_features' in batch[0]:
         collated['camera_BR_features'] = torch.stack([b['camera_BR_features'] for b in batch])
+    if 'map_features' in batch[0]:
+        collated['map_features'] = torch.stack([b['map_features'] for b in batch])
 
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, use_preprocessed=False, feature_path=None, norm_stats=None):      
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, feature_set=None, use_preprocessed=False, feature_path=None, norm_stats=True):
+        '''
+        data_pth: path to raw data
+        data_dir: root of raw data
+        n_history: length of history
+        n_horizon: length of future
+        max_obstacles: max number of agents in history
+        max_predict: max number of agents to predict
+        dynamic_only: predict only dynamic agents
+        use_camera: use camera data
+        use_lidar: use lidar data
+        use_bev: use BEV representation of lidar data
+        use_map: use map data
+        feature_set: identifier for set of map features to use
+        use_preprocessed: use preprocessed camera data
+        feature_path: path for camera features
+        norm_stats: mean, std to norm pose by
+        '''
+        assert feature_set in ['hpnet']
+
         self.use_camera_F = use_camera['F']
         self.use_camera_FL = use_camera['FL']
         self.use_camera_FR = use_camera['FR']
@@ -181,6 +202,8 @@ class NuScenesDataset(Dataset):
         self.use_preprocessed = use_preprocessed
 
         if self.use_map:
+            assert feature_set is not None
+            self.map_features = self.get_map_features(feature_set)
             raise NotImplementedError('Must define map features to use')
 
         self.n_history = n_history
@@ -232,7 +255,7 @@ class NuScenesDataset(Dataset):
         self.targets = np.take_along_axis(data['targets'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
         self.targets = torch.from_numpy(self.targets).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
 
-        # # future global frame pose
+        # future global frame pose
         self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].reshape(-1, n_horizon, 7).float() # (n_examples, n_horizon, 7)
         self.raw_target = np.take_along_axis(data['raw_target'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
         self.raw_target = torch.from_numpy(self.raw_target).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
@@ -309,53 +332,6 @@ class NuScenesDataset(Dataset):
             'idx': idx,                             # scalar
         }
 
-        # Camera Logic
-        # if self.use_camera_F:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         # FAST: Load from HDF5
-        #         # Since you have separate files for train/val, 
-        #         # idx 0 in this dataset is guaranteed to be row 0 in the HDF5 file.
-        #         sample['camera_F_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         # SLOW: Load raw JPGs
-        #         camera_F_seq = torch.stack([self.camera_loader(f) for f in self.camera_F_files[idx]])          
-        #         sample.update(camera_F=camera_F_seq)        # list of n_history tensors
-        # if self.use_camera_FL:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_FL_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_FL_seq = torch.stack([self.camera_loader(f) for f in self.camera_FL_files[idx]])          
-        #         sample.update(camera_FL=camera_FL_seq)        # list of n_history tensors
-        # if self.use_camera_FR:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_FR_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_FR_seq = torch.stack([self.camera_loader(f) for f in self.camera_FR_files[idx]])          
-        #         sample.update(camera_FR=camera_FR_seq)        # list of n_history tensors
-        # if self.use_camera_B:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_B_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_B_seq = torch.stack([self.camera_loader(f) for f in self.camera_B_files[idx]])          
-        #         sample.update(camera_B=camera_B_seq)        # list of n_history tensors
-        # if self.use_camera_BL:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_BL_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_BL_seq = torch.stack([self.camera_loader(f) for f in self.camera_BL_files[idx]])          
-        #         sample.update(camera_BL=camera_BL_seq)        # list of n_history tensors
-        # if self.use_camera_BR:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_BR_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_BR_seq = torch.stack([self.camera_loader(f) for f in self.camera_BR_files[idx]])          
-        #         sample.update(camera_BR=camera_BR_seq)        # list of n_history tensors
         # Helper to handle Feature vs Raw loading
         def load_camera_data(sensor_name, file_paths):
             if self.use_preprocessed:
@@ -403,6 +379,8 @@ class NuScenesDataset(Dataset):
             sample.update(lidar=lidar_seq)          # list of n_history tensors
         if self.use_bev:
             sample.update(bev=self.bev[idx])        # (n_history, 4, 256, 256)
+        if self.use_map:
+            sample.update(map_features=self.map_features[idx])
         
         return sample
 
@@ -484,3 +462,13 @@ class NuScenesDataset(Dataset):
         out = pos.clone()
         out[..., :3] = (out[..., :3] - mean) / std
         return out
+
+    def get_map_features(self, feature_set):
+        if feature_set == 'hpnet':
+            return self.get_hpnet_map_features()
+        else:
+            raise NotImplementedError
+    
+    def get_hpnet_map_features(self, feature_set):
+        raise NotImplementedError
+        return 0
