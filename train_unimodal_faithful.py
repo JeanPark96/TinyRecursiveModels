@@ -210,6 +210,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "seq_len": args.max_obstacles * args.n_history,
 
             "hidden_size": args.hidden_size,
+            "time_dim": 16,
             "expansion": 2.0,
             "num_heads": 4,
             "H_cycles": 3,
