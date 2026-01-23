@@ -73,6 +73,8 @@ class TRM_ACT_NuScenes_Config(BaseModel):
 
     # --- Camera Config ---
     # --- Vision Config (No intrinsics needed!) ---
+    # NEW FLAG: Controls if we use full history or just the last frame
+    use_last_vis_frame: bool = False
     use_camera: bool = True
     num_cameras: int = 6          # NEW
     cam_names: List[str] = ["F","FL","FR","B","BL","BR"]  # optional, for readability
@@ -287,31 +289,44 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         return self.embed_scale * emb, full_mask, visual_context, last_obs
     
     def _prepare_visual_context_from_batch(self, batch: Dict[str, torch.Tensor], T: int, device) -> Optional[torch.Tensor]:
-        # Collect selected cameras from batch
-        #selected = getattr(self.config, "use_cameras", ["F"])
-        #print(selected)
         cam_names = getattr(self.config, "cam_names", ["F","FL","FR","B","BL","BR"])
-        #print(cam_names, batch.keys())
         vis_seqs = []
+
+        # Logic to handle "Last Frame Only"
+        use_last = getattr(self.config, "use_last_vis_frame", False)
+
         for cam in cam_names:
-            key = f"camera_{cam}_features"  # you already have these keys
+            key = f"camera_{cam}_features"
             if key not in batch:
-                #print("does not exist")
                 continue
 
-            feats = batch[key]  # expected [B, T, 512, 9, 16] (precomputed)
+            feats = batch[key]  # [B, T, 512, 9, 16]
             B, T2, C, H, W = feats.shape
             assert T2 == T, f"{key} has T={T2}, expected {T}"
 
             feats = feats.to(self.forward_dtype)
 
-            # [B*T, 512, H, W]
-            feats = feats.view(B * T, C, H, W)
+            if use_last:
+                # 1. Slice: Take only the last timestep. Shape: [B, 1, C, H, W]
+                feats = feats[:, -1:, ...]
+                
+                # 2. Set processing length to 1
+                T_proc = 1
+                
+                # 3. CRITICAL: Use correct time embedding. 
+                # If we take the last frame, it corresponds to time index (T - 1)
+                time_indices = torch.tensor([T - 1], device=device)
+            else:
+                T_proc = T
+                time_indices = torch.arange(T, device=device)
 
-            # [B*T, H*W, 512]
+            # [B*T_proc, C, H, W] (using reshape to handle the sliced view correctly)
+            feats = feats.reshape(B * T_proc, C, H, W)
+
+            # [B*T_proc, H*W, 512]
             feats_flat = feats.flatten(2).transpose(1, 2)
 
-            # [B*T, H*W, D]
+            # [B*T_proc, H*W, D]
             tokens = self.vis_proj(feats_flat)
             tokens = self.vis_norm(tokens)
             tokens = tokens * self.embed_scale
@@ -319,37 +334,37 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             # spatial emb: [1, HW, D]
             tokens = tokens + self.vis_pos_emb
 
-            # reshape for time/cam embedding: [B, T, HW, D]
+            # reshape for time/cam embedding: [B, T_proc, HW, D]
             HW = tokens.shape[1]
-            tokens = tokens.view(B, T, HW, self.config.hidden_size)
+            tokens = tokens.view(B, T_proc, HW, self.config.hidden_size)
 
-            # add temporal embedding: [1, T, 1, D]
-            time_ids = torch.arange(T, device=device)
-            tokens = tokens + self.embed_time(time_ids).view(1, T, 1, self.config.hidden_size)
+            # add temporal embedding: [1, T_proc, 1, D]
+            tokens = tokens + self.embed_time(time_indices).view(1, T_proc, 1, self.config.hidden_size)
 
             # add camera-id embedding: [1, 1, 1, D]
             cam_id = torch.tensor([self.cam_to_id[cam]], device=device)
             tokens = tokens + self.embed_cam(cam_id).view(1, 1, 1, self.config.hidden_size)
 
-            # flatten: [B, T*HW, D]
-            tokens = tokens.view(B, T * HW, self.config.hidden_size)
+            # flatten: [B, T_proc*HW, D]
+            tokens = tokens.view(B, T_proc * HW, self.config.hidden_size)
 
             vis_seqs.append(tokens)
 
         if len(vis_seqs) == 0:
-            #print("Return None")
             return None
 
-        # concat cameras along sequence dimension: [B, sum_cam(T*HW), D]
+        # concat cameras along sequence dimension: [B, sum_cam(T_proc*HW), D]
         vis_tokens = torch.cat(vis_seqs, dim=1)
-        expected_len = self.config.num_cameras * T * HW
+        
+        # Verify length
+        T_expected = 1 if use_last else T
+        expected_len = self.config.num_cameras * T_expected * HW
         _, loc_seq_len, _ = vis_tokens.shape
-        #print("length", expected_len)
 
         assert loc_seq_len == expected_len, (
-        f"[Vision ERROR] visual token length mismatch: "
-        f"got seq_len={loc_seq_len}, expected={expected_len} "
-        f"(cams={len(vis_seqs)}, T={T}, HW={HW})."
+            f"[Vision ERROR] visual token length mismatch: "
+            f"got seq_len={loc_seq_len}, expected={expected_len} "
+            f"(cams={len(vis_seqs)}, T_proc={T_expected}, HW={HW})."
         )
 
         # add null token at front

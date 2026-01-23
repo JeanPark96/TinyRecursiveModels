@@ -226,7 +226,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "mlp_t": False,
 
             "num_cameras": len(args.cam_names),         
-            "cam_names": args.cam_names 
+            "cam_names": args.cam_names,
+            "use_last_vis_frame" : True 
 
         }
 
