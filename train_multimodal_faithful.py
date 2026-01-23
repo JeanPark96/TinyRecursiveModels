@@ -204,12 +204,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "in_dim": 7,
             "out_dim": 2,          # predict x,y
             "out_slice": 2,        # supervise x,y
-            "predict_delta": True,
+            "predict_delta": False,
 
             "global_len": 1,       # keep global latent token
             "seq_len": args.max_obstacles * args.n_history,
 
             "hidden_size": args.hidden_size,
+            "time_dim": 16,
             "expansion": 2.0,
             "num_heads": 4,
             "H_cycles": 3,
@@ -576,22 +577,22 @@ def load_dataset(args):
         else:
             args.split_dir = f'cam-{args.split_type}'
             filename_prefix = "all_camera_features"
-
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}/ood.npz'
+    root_data = "/home/hlpark/common-data/trm/data"
+    train_data_pth = f'{root_data}/{args.split_dir}/train.npz'
+    val_data_pth = f'{root_data}/{args.split_dir}/val.npz'
+    test_data_pth = f'{root_data}/{args.split_dir}/test.npz'
+    ood_data_pth = f'{root_data}/{args.split_dir}/ood.npz'
 
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
     
-    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_train.h5"
-    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_val.h5"
-    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_test.h5"
-    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_dir}_resnet_feat18/{filename_prefix}_ood.h5"
+    train_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_train.h5"
+    val_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_val.h5"
+    test_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_test.h5"
+    ood_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_ood.h5"
 
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history,
+    tr_dataset = NuScenesDataset(train_data_pth, root_data, args.n_history,
                                   args.n_horizon, args.max_obstacles, 
                                   args.max_predict, args.dynamic_only,
                                   use_camera=args.use_camera, 
@@ -606,7 +607,7 @@ def load_dataset(args):
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, 
+    val_dataset = NuScenesDataset(val_data_pth, root_data, args.n_history, args.n_horizon, 
                                   args.max_obstacles, args.max_predict, args.dynamic_only,
                                   use_camera=args.use_camera, use_lidar=args.lidar, 
                                   use_bev=args.bev, use_map=args.map,
