@@ -9,7 +9,7 @@ import torchvision.models as models
 
 from models.common import trunc_normal_init_
 from models.layers import (
-    rms_norm, SwiGLU, Attention_Mask, RotaryEmbedding, CosSin,
+    rms_norm, SwiGLU, Attention_Mask, RotaryEmbedding, CosSin, SinusoidalPositionEmbeddings,
     CastedEmbedding, CastedLinear
 )
 
@@ -46,7 +46,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
     in_dim: int = 7
     out_dim: int = 2
     out_slice: int = 2
-    predict_delta: bool = True
+    predict_delta: bool = False
     global_len: int = 1
     seq_len: int = 360  # max_obstacles * n_history
 
@@ -58,6 +58,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
 
     # Transformer
     hidden_size: int
+    time_dim: int = 16
     expansion: float
     num_heads: int
     pos_encodings: str
@@ -73,6 +74,8 @@ class TRM_ACT_NuScenes_Config(BaseModel):
 
     # --- Camera Config ---
     # --- Vision Config (No intrinsics needed!) ---
+    # NEW FLAG: Controls if we use full history or just the last frame
+    use_last_vis_frame: bool = False
     use_camera: bool = True
     num_cameras: int = 6          # NEW
     cam_names: List[str] = ["F","FL","FR","B","BL","BR"]  # optional, for readability
@@ -214,8 +217,15 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
 
         # --- Standard Embeddings ---
         self.embed_inputs = CastedLinear(self.config.in_dim, self.config.hidden_size, bias=True)
-        self.embed_agent = CastedEmbedding(self.config.max_obstacles, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.embed_time = CastedEmbedding(self.config.n_history, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        # self.embed_agent = CastedEmbedding(self.config.max_obstacles, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        # self.embed_time = CastedEmbedding(self.config.n_history, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+        self.embed_time = nn.Sequential(
+            SinusoidalPositionEmbeddings(self.config.time_dim),
+            CastedLinear(self.config.time_dim, self.config.hidden_size, bias=True),
+            nn.GELU(),
+            CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=True),
+        )
+        
         self.cam_to_id = {name: i for i, name in enumerate(self.config.cam_names)}
         self.embed_cam = CastedEmbedding(len(self.config.cam_names), self.config.hidden_size,
                                         init_std=embed_init_std, cast_to=self.forward_dtype)
@@ -259,10 +269,12 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         # --- 1. Agent Embeddings ---
         emb = self.embed_inputs(obs_pose.to(self.forward_dtype)) # [B, T, A, D]
         
-        time_ids = torch.arange(T, device=obs_pose.device)
-        agent_ids = torch.arange(A, device=obs_pose.device)
-        emb = emb + self.embed_time(time_ids)[None, :, None, :] + self.embed_agent(agent_ids)[None, None, :, :]
-        
+        # time_ids = torch.arange(T, device=obs_pose.device)
+        # agent_ids = torch.arange(A, device=obs_pose.device)
+        # emb = emb + self.embed_time(time_ids)[None, :, None, :] + self.embed_agent(agent_ids)[None, None, :, :]
+        time_ids = torch.arange(T, device=obs_pose.device) / T
+        emb = emb + self.embed_time(time_ids)[None, :, None, :]
+
         emb = emb.permute(0, 2, 1, 3).contiguous().view(B, A * T, self.config.hidden_size)
         token_mask = obs_mask.to(torch.bool).permute(0, 2, 1).contiguous().view(B, A * T)
         emb = emb * token_mask[..., None].to(emb.dtype)
@@ -287,31 +299,44 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         return self.embed_scale * emb, full_mask, visual_context, last_obs
     
     def _prepare_visual_context_from_batch(self, batch: Dict[str, torch.Tensor], T: int, device) -> Optional[torch.Tensor]:
-        # Collect selected cameras from batch
-        #selected = getattr(self.config, "use_cameras", ["F"])
-        #print(selected)
         cam_names = getattr(self.config, "cam_names", ["F","FL","FR","B","BL","BR"])
-        #print(cam_names, batch.keys())
         vis_seqs = []
+
+        # Logic to handle "Last Frame Only"
+        use_last = getattr(self.config, "use_last_vis_frame", False)
+
         for cam in cam_names:
-            key = f"camera_{cam}_features"  # you already have these keys
+            key = f"camera_{cam}_features"
             if key not in batch:
-                #print("does not exist")
                 continue
 
-            feats = batch[key]  # expected [B, T, 512, 9, 16] (precomputed)
+            feats = batch[key]  # [B, T, 512, 9, 16]
             B, T2, C, H, W = feats.shape
             assert T2 == T, f"{key} has T={T2}, expected {T}"
 
             feats = feats.to(self.forward_dtype)
 
-            # [B*T, 512, H, W]
-            feats = feats.view(B * T, C, H, W)
+            if use_last:
+                # 1. Slice: Take only the last timestep. Shape: [B, 1, C, H, W]
+                feats = feats[:, -1:, ...]
+                
+                # 2. Set processing length to 1
+                T_proc = 1
+                
+                # 3. CRITICAL: Use correct time embedding. 
+                # If we take the last frame, it corresponds to time index (T - 1)
+                time_indices = torch.tensor([T - 1], device=device)
+            else:
+                T_proc = T
+                time_indices = torch.arange(T, device=device)
 
-            # [B*T, H*W, 512]
+            # [B*T_proc, C, H, W] (using reshape to handle the sliced view correctly)
+            feats = feats.reshape(B * T_proc, C, H, W)
+
+            # [B*T_proc, H*W, 512]
             feats_flat = feats.flatten(2).transpose(1, 2)
 
-            # [B*T, H*W, D]
+            # [B*T_proc, H*W, D]
             tokens = self.vis_proj(feats_flat)
             tokens = self.vis_norm(tokens)
             tokens = tokens * self.embed_scale
@@ -319,37 +344,37 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             # spatial emb: [1, HW, D]
             tokens = tokens + self.vis_pos_emb
 
-            # reshape for time/cam embedding: [B, T, HW, D]
+            # reshape for time/cam embedding: [B, T_proc, HW, D]
             HW = tokens.shape[1]
-            tokens = tokens.view(B, T, HW, self.config.hidden_size)
+            tokens = tokens.view(B, T_proc, HW, self.config.hidden_size)
 
-            # add temporal embedding: [1, T, 1, D]
-            time_ids = torch.arange(T, device=device)
-            tokens = tokens + self.embed_time(time_ids).view(1, T, 1, self.config.hidden_size)
+            # add temporal embedding: [1, T_proc, 1, D]
+            tokens = tokens + self.embed_time(time_indices).view(1, T_proc, 1, self.config.hidden_size)
 
             # add camera-id embedding: [1, 1, 1, D]
             cam_id = torch.tensor([self.cam_to_id[cam]], device=device)
             tokens = tokens + self.embed_cam(cam_id).view(1, 1, 1, self.config.hidden_size)
 
-            # flatten: [B, T*HW, D]
-            tokens = tokens.view(B, T * HW, self.config.hidden_size)
+            # flatten: [B, T_proc*HW, D]
+            tokens = tokens.view(B, T_proc * HW, self.config.hidden_size)
 
             vis_seqs.append(tokens)
 
         if len(vis_seqs) == 0:
-            #print("Return None")
             return None
 
-        # concat cameras along sequence dimension: [B, sum_cam(T*HW), D]
+        # concat cameras along sequence dimension: [B, sum_cam(T_proc*HW), D]
         vis_tokens = torch.cat(vis_seqs, dim=1)
-        expected_len = self.config.num_cameras * T * HW
+        
+        # Verify length
+        T_expected = 1 if use_last else T
+        expected_len = self.config.num_cameras * T_expected * HW
         _, loc_seq_len, _ = vis_tokens.shape
-        #print("length", expected_len)
 
         assert loc_seq_len == expected_len, (
-        f"[Vision ERROR] visual token length mismatch: "
-        f"got seq_len={loc_seq_len}, expected={expected_len} "
-        f"(cams={len(vis_seqs)}, T={T}, HW={HW})."
+            f"[Vision ERROR] visual token length mismatch: "
+            f"got seq_len={loc_seq_len}, expected={expected_len} "
+            f"(cams={len(vis_seqs)}, T_proc={T_expected}, HW={HW})."
         )
 
         # add null token at front
@@ -439,16 +464,38 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_obs = self.config.n_history
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
-        
+        targets_idx = batch["targets_idx"]
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
         agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
 
-        # 2. Reshape to independent sequences: [B, Aout*T_obs, D]
-        #    This groups all history for a specific agent together.
-        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D).view(B, A * T_obs, D)
+        # # 2. Reshape to independent sequences: [B, Aout*T_obs, D]
+        # #    This groups all history for a specific agent together.
+        # history_kv = agent_tokens.contiguous().view(B, A, T_obs, D)
+        # if Aout < A:
+        #     history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
+        #     history_kv = history_kv.view(B, Aout * T_obs, D)
+        # else:
+        #     history_kv = history_kv.view(B, A * T_obs, D)
 
-        # 3. Expand future queries: [B, Aout*T_pred, D]
-        queries = self.future_queries.expand(B, Aout, -1, -1).reshape(B, Aout * T_pred, D)
+        # # 3. Expand future queries: [B, Aout*T_pred, D]
+        # queries = self.future_queries.expand(B, Aout, -1, -1).reshape(B, Aout * T_pred, D)
+        # 2. Reshape to [B, A, T_obs, D] to isolate agents
+        history_kv = agent_tokens.contiguous().view(B, A, T_obs, D)
+        
+        # 3. Select only the targets we want to predict
+        #    Output: [B, Aout, T_obs, D]
+        if Aout < A:
+            history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
+        
+        # 4. FOLD AGENTS INTO BATCH
+        #    New Shape: [B * Aout, T_obs, D]
+        #    This effectively creates "B * Aout" independent sequences.
+        history_kv = history_kv.view(B * Aout, T_obs, D)
+
+        # 5. Prepare Queries
+        #    Expand generic queries to match the batch-folded size
+        #    New Shape: [B * Aout, T_pred, D]
+        queries = self.future_queries.expand(B * Aout, -1, -1, -1).reshape(B * Aout, T_pred, D)
 
         # 4. Cross Attention: Future queries attend to history
         #    attn_out: [B, Aout*T_pred, D]
@@ -466,7 +513,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
 
         # =================================================================
 
-        targets_idx = batch["targets_idx"]
+        
 
         # delta decoding for first out_slice dims
         if self.config.predict_delta and self.config.out_slice > 0:
