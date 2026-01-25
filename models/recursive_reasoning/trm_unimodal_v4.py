@@ -287,44 +287,11 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(
+    def decode(
         self,
-        carry: TRM_ACT_NuScenes_InnerCarry,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[TRM_ACT_NuScenes_InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-
-        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
-
-        input_embeddings, full_mask, last_obs = self._input_embeddings(
-            batch["obs_pose"], batch["obs_mask"]
-        )
-
-        z_H, z_L = carry.z_H, carry.z_L
-
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _ in range(self.config.H_cycles - 1):
-                for _ in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
-                z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
-        # 1 with grad
-        for _ in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
-        z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
-
-        new_carry = TRM_ACT_NuScenes_InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
-
-        # global latent (kept)
-        global_latent = z_H[:, 0]  # [B, D]
-
-        # Q head on global token
-        q_logits = self.q_head(global_latent).to(torch.float32)
-        q_halt_logits, q_continue_logits = q_logits[..., 0], q_logits[..., 1]
-
-        # =================================================================
-        # Query-Based Decoding Implementation
-        # =================================================================
-        
+        z_H,
+        batch
+    ):
         B = z_H.shape[0]
         A = self.config.max_obstacles
         Aout = self.config.max_predict
@@ -332,6 +299,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
         targets_idx = batch["targets_idx"]
+        last_obs = batch["obs_pose"][:, -1].to(self.forward_dtype)  # [B, A, 7]
         assert Aout <= A
 
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
@@ -377,7 +345,58 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         last_step_mask = torch.gather(batch["obs_mask"][:, -1], dim=1, index=targets_idx).to(torch.bool)  # [B, Aout]
         pred = pred * last_step_mask[:, :, None, None].to(pred.dtype)
 
-        return new_carry, pred, (q_halt_logits, q_continue_logits), global_latent
+        return pred
+
+    def forward(
+        self,
+        carry: TRM_ACT_NuScenes_InnerCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[TRM_ACT_NuScenes_InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+
+        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
+
+        input_embeddings, full_mask, last_obs = self._input_embeddings(
+            batch["obs_pose"], batch["obs_mask"]
+        )
+
+        z_H, z_L = carry.z_H, carry.z_L
+        pred_recursions = [z_H]
+
+        # H_cycles-1 without grad
+        # print()
+        with torch.no_grad():
+            for _ in range(self.config.H_cycles - 1):
+                for _ in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
+                z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
+                pred_recursions.append(z_H)
+                # print(z_H[0,1:10,0])
+                # print(z_L[0,1:10,0])
+        # 1 with grad
+        for _ in range(self.config.L_cycles):
+            z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
+        z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
+        pred_recursions.append(z_H)
+        
+        pred_recursions = torch.stack(pred_recursions, dim=0)
+
+        new_carry = TRM_ACT_NuScenes_InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+
+        # global latent (kept)
+        global_latent = z_H[:, 0]  # [B, D]
+
+        # Q head on global token
+        q_logits = self.q_head(global_latent).to(torch.float32)
+        q_halt_logits, q_continue_logits = q_logits[..., 0], q_logits[..., 1]
+        # print(q_halt_logits[:10])
+
+        # =================================================================
+        # Query-Based Decoding Implementation
+        # =================================================================
+
+        pred = self.decode(z_H, batch)
+
+        return new_carry, pred, (q_halt_logits, q_continue_logits), global_latent, pred_recursions
 
 
 # =========================
@@ -400,6 +419,9 @@ class TRM_ACT_NuScenes(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
             prev_loss=torch.full((B,), float('inf'), dtype=torch.float32, device=device)
         )
+
+    def decode(self, *args, **kwargs):
+        return self.inner.decode(*args, **kwargs)
 
     def forward(
         self,
@@ -424,7 +446,7 @@ class TRM_ACT_NuScenes(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_inner_carry, pred, (q_halt_logits, q_continue_logits), global_latent = self.inner(
+        new_inner_carry, pred, (q_halt_logits, q_continue_logits), global_latent, pred_recursions = self.inner(
             new_inner_carry, new_current_data
         )
 
@@ -433,6 +455,7 @@ class TRM_ACT_NuScenes(nn.Module):
             "global_latent": global_latent,      # [B, D]
             "q_halt_logits": q_halt_logits,      # [B]
             "q_continue_logits": q_continue_logits,
+            "pred_recursions": pred_recursions, # [H_cycles, B, A*H+1, D]
         }
 
         with torch.no_grad():

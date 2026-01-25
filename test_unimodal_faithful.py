@@ -11,7 +11,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
 
-import tqdm
+from tqdm import tqdm
 # import wandb
 # import coolname
 # import hydra
@@ -25,6 +25,7 @@ from models.ema import EMAHelper
 
 # new imports
 from nuscenes_dataset import load_dataset
+from utils.metrics import compute_metrics
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, plot_test_batch
@@ -35,7 +36,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v2 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -43,7 +44,7 @@ importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v2 import (
+from models.recursive_reasoning.trm_unimodal_v4 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -65,57 +66,6 @@ class TrainState:
 
     step: int
     total_steps: int
-
-def mix_weights_direct(device, alpha, net, nets):
-    sd = []
-    for i in range(len(nets)):
-        sd += [nets[i].state_dict()]
-    sd_alpha = {}
-    for k in sd[0].keys():
-        comb_net = alpha[0]*sd[0][k].to(device)
-        for i in range(1,len(nets)):
-            comb_net += alpha[i]*sd[i][k].to(device)
-        sd_alpha[k] =  comb_net
-    net.load_state_dict(sd_alpha)
-    return net
-
-def cosine_schedule_with_warmup_lr_lambda(
-    current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
-):
-    if current_step < num_warmup_steps:
-        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
-
-    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
-
-# def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
-#     return cosine_schedule_with_warmup_lr_lambda(
-#         current_step=train_state.step,
-#         base_lr=base_lr,
-#         num_warmup_steps=round(config.lr_warmup_steps),
-#         num_training_steps=train_state.total_steps,
-#         min_ratio=config.lr_min_ratio
-#     )
-
-@torch.no_grad()
-def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
-    """
-    Returns scalar ADE/FDE (averaged over valid agents+timesteps).
-    """
-    tgt = targets[..., :out_slice].permute(0, 2, 1, 3).contiguous()         # [B,A,H,2]
-    m = targets_mask.permute(0, 2, 1).to(pred.dtype).contiguous()           # [B,A,H]
-
-    pred_xy = pred[..., :out_slice]
-    dist = torch.linalg.norm(pred_xy - tgt, dim=-1)                         # [B,A,H]
-
-    ade = (dist * m).sum() / (m.sum() + 1e-6)
-
-    # FDE: last horizon step only
-    dist_last = dist[:, :, -1]
-    m_last = m[:, :, -1]
-    fde = (dist_last * m_last).sum() / (m_last.sum() + 1e-6)
-
-    return ade.item(), fde.item()
 
 def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     if ood:
@@ -173,11 +123,11 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     else:
         logger.log("Running Test...")
     train_state.model.eval()
-    ade_sum = fde_sum = ade_real_sum = fde_real_sum = loss_sum = 0.0
+    ade_sum = fde_sum = ade_real_sum = fde_real_sum = mr_sum = loss_sum = 0.0
     n = 0
 
     with torch.no_grad():
-        for b, batch in enumerate(dataloader):
+        for b, batch in tqdm(enumerate(dataloader)):
             if b % 10 == 0:
                 print(f'Batch {b}')
 
@@ -185,6 +135,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             obs_mask = batch["obs_mask"].to(device)
             targets = batch["targets"].to(device)
             targets_mask = batch.get("targets_mask", None)
+            targets_idx = batch.get("targets_idx", None).to(device)
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -196,6 +147,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                 "obs_mask": obs_mask,
                 "targets": targets,
                 "targets_mask": targets_mask,
+                "targets_idx": targets_idx,
             }
 
             with torch.device("cuda"):
@@ -205,7 +157,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             inference_steps = 0
             while True:
                 carry, loss, metrics, outputs, all_finish = train_state.model(
-                    carry=carry, batch=model_input, return_keys=["pred"]
+                    carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                 )
                 inference_steps += 1
 
@@ -221,6 +173,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                 device,
                 run_name=f'test_{RUN_NAME}',
                 out_slice=config_dict["out_slice"],
+                sub_name=args.tboard_name,
             )
 
             # Reduce metrics
@@ -240,15 +193,15 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                     
             # calc extra metrics
             pred = outputs["pred"]
-            ade, fde = compute_ade_fde(
-                pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+            ade, fde, _ = compute_metrics(
+                pred, targets, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
             targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-            ade_real, fde_real = compute_ade_fde(
-                pred_xy_denorm, targets_xy_denorm, targets_mask, out_slice=config_dict["out_slice"]
+            ade_real, fde_real, mr = compute_metrics(
+                pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             # log metrics
@@ -256,13 +209,36 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             fde_sum += fde
             ade_real_sum += ade_real
             fde_real_sum += fde_real
+            mr_sum += mr
             loss_sum += reduced_metrics['val/loss']
             n += 1
+
+            # plot recursions
+            pred_recursions = outputs["pred_recursions"] # [H_cycles, B, A*H+1, D]
+            # print(pred_recursions[:,0,0,0])
+            # raise NotImplementedError
+            valid_batch_idxs = valid_agent_idxs = None
+            for cycle in range(pred_recursions.size(0)):
+                recursion_out = train_state.model.decode(pred_recursions[cycle], model_input)
+                valid_batch_idxs, valid_agent_idxs = plot_test_batch(
+                    dataset,
+                    batch,
+                    b,
+                    recursion_out,
+                    device,
+                    run_name=f'recursions_{RUN_NAME}',
+                    out_slice=config_dict["out_slice"],
+                    sub_name=args.tboard_name,
+                    filename=f'recursion{cycle}',
+                    valid_batch_idxs=valid_batch_idxs,
+                    valid_agent_idxs=valid_agent_idxs,
+                )
 
     ave_ade = ade_sum / max(n, 1)
     ave_fde = fde_sum / max(n, 1)
     ave_ade_real = ade_real_sum / max(n, 1)
     ave_fde_real = fde_real_sum / max(n, 1)
+    mr = mr_sum / max(n, 1)
     ave_loss = loss_sum / max(n, 1)
 
     if ood:
@@ -272,7 +248,8 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             f"ADE: {ave_ade:.4f} | "
             f"FDE: {ave_fde:.4f} | "
             f"Real ADE: {ave_ade_real:.4f} | "
-            f"Real FDE: {ave_fde_real:.4f}"
+            f"Real FDE: {ave_fde_real:.4f} | "
+            f"Miss rate: {val_mr:.2f}"
         )
         logger.log("OOD Complete.")
     else:
@@ -289,10 +266,11 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
+    parser.add_argument("--tboard_name", type=str, help="Name for tensorboard run")
     parser.add_argument("--model_pth", type=str)
     parser.add_argument("--hidden_size", type=int, default=256)
-    parser.add_argument("--halt_max_steps", type=int, default=1)
-    parser.add_argument("--config_batch_size", type=int, default=16)
+    parser.add_argument("--halt_max_steps", type=int, default=16)
+    parser.add_argument("--config_batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=4501)
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU id to use (0-based)")
     parser.add_argument('--split_type', type=str, default='standard', help='Dataset split methods. OOD splits of type oodType are named with convention oodType-oodSubType, where oodSubType does not appear in the ID train/val/test distribution.',
@@ -313,12 +291,16 @@ if __name__ == "__main__":
     parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+    parser.add_argument('--map', action='store_true', help='Add map context.')
     
     # task parameters (non-defaults are used for sanity checking and testing)
     parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
     parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
     parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
-    
+    parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
+    parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
+    parser.add_argument("--feature_set", type=str, choices=['hpnet'], help="Types of map features to use")
+
     args = parser.parse_args()
 
     assert os.path.exists(args.model_pth)

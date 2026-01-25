@@ -116,7 +116,9 @@ def train_batch(train_state: TrainState, batch: Any):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=["pred"])
+    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry,
+                                                                     batch=batch,
+                                                                     return_keys=["pred", "pred_recursions"])
 
     ((1 / batch_size) * loss).backward()
             
@@ -154,10 +156,10 @@ def train_batch(train_state: TrainState, batch: Any):
 
 def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy):
     RUN_NAME = args.run_name
-    LOG_DIR = "logs"
+    LOG_DIR = os.path.join("logs", RUN_NAME)
     CKPT_DIR = "checkpoints"
     TBOARD_DIR = "tboard"
-    run_ckpt_dir = os.path.join(CKPT_DIR, RUN_NAME)
+    run_ckpt_dir = os.path.join(CKPT_DIR, RUN_NAME, args.tboard_name)
     os.makedirs(run_ckpt_dir, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(TBOARD_DIR, exist_ok=True)
@@ -236,7 +238,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             print(f"No checkpoint found at {last_ckpt_path}; starting from scratch.")
 
     # Initialize Logger
-    logger = Logger(LOG_DIR, RUN_NAME, config_dict)
+    logger = Logger(LOG_DIR, args.tboard_name, config_dict)
     logger.log("Loading Dataset...")
     logger.log(f"Dataset Loaded. Train samples: {len(tr_dataset)}, Val samples: {len(val_dataset)}")
 
@@ -423,7 +425,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     inference_steps = 0
                     while True:
                         carry, loss, metrics, outputs, all_finish = train_state.model(
-                            carry=carry, batch=model_input, return_keys=["pred"]
+                            carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                         )
                         inference_steps += 1
 
@@ -597,6 +599,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles in context.')
     parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
     parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
+    parser.add_argument("--feature_set", type=str, choices=['hpnet'], help="Types of map features to use")
 
     args = parser.parse_args()
 
