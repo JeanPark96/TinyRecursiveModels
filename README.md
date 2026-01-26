@@ -34,6 +34,7 @@ wandb login YOUR-LOGIN # login if you want the logger to sync results to your We
 Added requirements:
 ```
 pip install tensorboard
+pip install nuscenes-devkit
 ```
 While running the training code, you can run in another terminal `tensorboard --logdir=tboard/RUN_NAME` and open the browser link it gives you. This will open a nice UI for monitoring the training. Pass arg --port 8008 to run on port 800 instead of the default, etc
 

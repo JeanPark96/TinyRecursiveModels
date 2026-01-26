@@ -15,6 +15,8 @@ import random
 import h5py
 import torch
 import numpy as np
+from nuscenes.map_expansion.map_api import NuScenesMap
+from tqdm import tqdm
 
 DYNAMIC_TYPES = ['animal',
                  'adult', 'child', 'construction_worker', 'personal_mobility', 'police_officer', 'stroller', 'wheelchair',
@@ -53,7 +55,7 @@ def load_dataset(args):
 
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map)
+    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, feature_set=args.feature_set)
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
@@ -61,11 +63,11 @@ def load_dataset(args):
     print('Updated train dataset with normalization stats!')
 
     print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
+    val_dataset = NuScenesDataset(val_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, feature_set=args.feature_set, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, feature_set=args.feature_set, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
     tr_dataloader = DataLoader(tr_dataset, batch_size=args.config_batch_size, shuffle=True, collate_fn=custom_collate, drop_last=True) # need to trop last for asynchronous deep supervision
@@ -81,7 +83,7 @@ def load_dataset(args):
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, args.max_predict, args.dynamic_only, use_camera=camera, use_lidar=args.lidar, use_bev=args.bev, use_map=args.map, feature_set=args.feature_set, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -164,11 +166,31 @@ def custom_collate(batch):
         collated['camera_BL_features'] = torch.stack([b['camera_BL_features'] for b in batch])
     if 'camera_BR_features' in batch[0]:
         collated['camera_BR_features'] = torch.stack([b['camera_BR_features'] for b in batch])
+    if 'map_features' in batch[0]:
+        collated['map_features'] = torch.stack([b['map_features'] for b in batch])
 
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, use_preprocessed=False, feature_path=None, norm_stats=None):      
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, feature_set=None, use_preprocessed=False, feature_path=None, norm_stats=None):
+        '''
+        data_pth: path to raw data
+        data_dir: root of raw data
+        n_history: length of history
+        n_horizon: length of future
+        max_obstacles: max number of agents in history
+        max_predict: max number of agents to predict
+        dynamic_only: predict only dynamic agents
+        use_camera: use camera data
+        use_lidar: use lidar data
+        use_bev: use BEV representation of lidar data
+        use_map: use map data
+        feature_set: identifier for set of map features to use
+        use_preprocessed: use preprocessed camera data
+        feature_path: path for camera features
+        norm_stats: mean, std to norm pose by
+        '''
+
         self.use_camera_F = use_camera['F']
         self.use_camera_FL = use_camera['FL']
         self.use_camera_FR = use_camera['FR']
@@ -179,9 +201,6 @@ class NuScenesDataset(Dataset):
         self.use_bev = use_bev
         self.use_map = use_map
         self.use_preprocessed = use_preprocessed
-
-        if self.use_map:
-            raise NotImplementedError('Must define map features to use')
 
         self.n_history = n_history
         self.n_horizon = n_horizon
@@ -232,7 +251,7 @@ class NuScenesDataset(Dataset):
         self.targets = np.take_along_axis(data['targets'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
         self.targets = torch.from_numpy(self.targets).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
 
-        # # future global frame pose
+        # future global frame pose
         self.ego_target = torch.from_numpy(data['ego_target'])[:, :n_horizon, :].reshape(-1, n_horizon, 7).float() # (n_examples, n_horizon, 7)
         self.raw_target = np.take_along_axis(data['raw_target'][:, :n_horizon, :, :], self.target_idx[:, None, :, None].numpy(), axis=2)
         self.raw_target = torch.from_numpy(self.raw_target).reshape(-1, n_horizon, max_predict, 7).float() # (n_examples, n_horizon, max_predict, 7)
@@ -262,6 +281,13 @@ class NuScenesDataset(Dataset):
                 raise ValueError("You must provide 'feature_path' when use_preprocessed=True")
             
             self.feature_loader = HDF5FeatureLoader(feature_path)
+
+        # Map features
+        if self.use_map:
+            assert feature_set is not None, 'Must define map features to use'
+            assert feature_set in ['hpnet']
+            self.map_names = data['map'] # strings: (n_examples, )
+            self.map_features = self.get_map_features(feature_set)
 
     def __len__(self):
         return self.n_samples
@@ -309,53 +335,6 @@ class NuScenesDataset(Dataset):
             'idx': idx,                             # scalar
         }
 
-        # Camera Logic
-        # if self.use_camera_F:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         # FAST: Load from HDF5
-        #         # Since you have separate files for train/val, 
-        #         # idx 0 in this dataset is guaranteed to be row 0 in the HDF5 file.
-        #         sample['camera_F_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         # SLOW: Load raw JPGs
-        #         camera_F_seq = torch.stack([self.camera_loader(f) for f in self.camera_F_files[idx]])          
-        #         sample.update(camera_F=camera_F_seq)        # list of n_history tensors
-        # if self.use_camera_FL:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_FL_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_FL_seq = torch.stack([self.camera_loader(f) for f in self.camera_FL_files[idx]])          
-        #         sample.update(camera_FL=camera_FL_seq)        # list of n_history tensors
-        # if self.use_camera_FR:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_FR_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_FR_seq = torch.stack([self.camera_loader(f) for f in self.camera_FR_files[idx]])          
-        #         sample.update(camera_FR=camera_FR_seq)        # list of n_history tensors
-        # if self.use_camera_B:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_B_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_B_seq = torch.stack([self.camera_loader(f) for f in self.camera_B_files[idx]])          
-        #         sample.update(camera_B=camera_B_seq)        # list of n_history tensors
-        # if self.use_camera_BL:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_BL_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_BL_seq = torch.stack([self.camera_loader(f) for f in self.camera_BL_files[idx]])          
-        #         sample.update(camera_BL=camera_BL_seq)        # list of n_history tensors
-        # if self.use_camera_BR:
-        #     if self.use_preprocessed:
-        #         raise NotImplementedError
-        #         sample['camera_BR_features'] = self.feature_loader.get_features(idx)
-        #     else:
-        #         camera_BR_seq = torch.stack([self.camera_loader(f) for f in self.camera_BR_files[idx]])          
-        #         sample.update(camera_BR=camera_BR_seq)        # list of n_history tensors
         # Helper to handle Feature vs Raw loading
         def load_camera_data(sensor_name, file_paths):
             if self.use_preprocessed:
@@ -403,6 +382,8 @@ class NuScenesDataset(Dataset):
             sample.update(lidar=lidar_seq)          # list of n_history tensors
         if self.use_bev:
             sample.update(bev=self.bev[idx])        # (n_history, 4, 256, 256)
+        if self.use_map:
+            sample.update(map_features=self.map_features[idx])
         
         return sample
 
@@ -484,3 +465,251 @@ class NuScenesDataset(Dataset):
         out = pos.clone()
         out[..., :3] = (out[..., :3] - mean) / std
         return out
+
+    def get_map_features(self, feature_set):
+        if feature_set == 'hpnet':
+            return self.get_hpnet_map_features(feature_set)
+        else:
+            raise NotImplementedError
+    
+    def get_hpnet_map_features(self, feature_set, margin=50.0, save=True, pth='map_features/hpnet.pt'):
+        print('Processing HPNet-style map features...')
+        if save:
+            os.make_dirs(pth, exist_ok=True)
+
+        map_features = []
+        for idx in tqdm(range(self.n_samples)):
+            data = {
+                'city': self.map_names[idx].split('-')[0],
+                'lane': {},
+                'centerline': {},
+                ('centerline', 'lane'): {},
+                ('lane', 'lane'): {}
+            }
+            nusc_map = NuScenesMap(dataroot=self.raw_data_dir, map_name=self.map_names[idx])
+
+            # agent history info
+            global_ego = self.ego_pose[idx] # H, 7
+            global_agent = self.raw_obs_pose[idx] # H, A, 7
+            agent_mask = self.obs_mask[idx] # H, A
+
+            # bounding box at current timestep
+            valid_positions = global_agent[-1][agent_mask[-1]>0] # A, 7
+
+            left_boundary = min(valid_positions[:,0])
+            right_boundary = max(valid_positions[:,0])
+            down_boundary = min(valid_positions[:,1])
+            up_boundary = max(valid_positions[:,1])
+        
+            lane_tokens = nusc_map.get_records_in_radius(
+                x = (left_boundary + right_boundary) / 2,
+                y = (down_boundary + up_boundary) / 2,
+                radius = max((right_boundary - left_boundary) / 2, (up_boundary - down_boundary) / 2) + margin,
+                layer_names=['lane', 'lane_connector']
+            )
+
+            all_lane_tokens = lane_tokens['lane'] + lane_tokens['lane_connector']
+            num_lanes = len(all_lane_tokens)
+
+            # lane-level tensors
+            lane_position = torch.zeros(num_lanes, 2, dtype=torch.float)
+            lane_heading = torch.zeros(num_lanes, dtype=torch.float)
+            lane_length = torch.zeros(num_lanes, dtype=torch.float)
+            lane_is_intersection = torch.zeros(num_lanes, dtype=torch.uint8)
+            lane_turn_direction = torch.zeros(num_lanes, dtype=torch.uint8)
+            lane_traffic_control = torch.zeros(num_lanes, dtype=torch.uint8)
+
+            num_centerlines = torch.zeros(num_lanes, dtype=torch.long)
+            centerline_position: List[Optional[torch.Tensor]] = [None] * num_lanes
+            centerline_heading: List[Optional[torch.Tensor]] = [None] * num_lanes
+            centerline_length: List[Optional[torch.Tensor]] = [None] * num_lanes
+
+            lane_token_to_idx = {t: i for i, t in enumerate(all_lane_tokens)}
+
+            lane_adjacent_edge_index = []
+            lane_predecessor_edge_index = []
+            lane_successor_edge_index = []
+            for i, lane_token in enumerate(all_lane_tokens):
+                lane_record = nusc_map.get('lane', lane_token) \
+                    if lane_token in lane_tokens['lane'] \
+                    else nusc_map.get('lane_connector', lane_token)
+
+                # centerline
+                arclines = nusc_map.get_arcline_path(lane_token)
+
+                # Some lanes may not have an arcline definition
+                if arclines is None or len(arclines) == 0:
+                    # Fallback: use lane polygon centroid if available, else skip
+                    poly = nusc_map.get_lane_polygon(lane_token) if hasattr(nusc_map, "get_lane_polygon") else None
+                    if poly is None or len(poly) == 0:
+                        # Make this lane effectively empty
+                        centerline_position[i] = torch.zeros(0, 2)
+                        centerline_heading[i] = torch.zeros(0)
+                        centerline_length[i] = torch.zeros(0)
+                        num_centerlines[i] = 0
+                        continue
+                    pts_t = torch.from_numpy(np.asarray(poly)[:, :2]).float()
+                else:
+                    # nuScenes returns a list of arcline dicts; typically length=1
+                    arc = arclines[0]
+                    x, y, yaw = arc["start_pose"]          # yaw is in radians in nuScenes maps
+                    shape = arc["shape"]                   # e.g., "LSL"
+                    r = float(arc["radius"])
+                    seg_lens = [float(v) for v in arc["segment_length"]]
+
+                    # Sampling resolution (meters). Adjust if you want denser/sparser polylines.
+                    ds = 1.0
+
+                    pts = [(x, y)]
+
+                    def rot2(vx, vy, a):
+                        ca, sa = np.cos(a), np.sin(a)
+                        return ca * vx - sa * vy, sa * vx + ca * vy
+
+                    # unit vectors given heading yaw
+                    def fwd(th):
+                        return np.cos(th), np.sin(th)
+
+                    def left(th):
+                        return -np.sin(th), np.cos(th)
+
+                    cur_x, cur_y, cur_yaw = x, y, yaw
+
+                    for seg_type, L in zip(shape, seg_lens):
+                        if L <= 1e-6:
+                            continue
+
+                        if seg_type == "S":
+                            # Straight segment
+                            n = max(1, int(np.ceil(L / ds)))
+                            step = L / n
+                            fx, fy = fwd(cur_yaw)
+                            for _ in range(n):
+                                cur_x += fx * step
+                                cur_y += fy * step
+                                pts.append((cur_x, cur_y))
+
+                        elif seg_type in ("L", "R"):
+                            # Arc segment: angle = arc_length / radius
+                            dtheta = L / r
+                            sign = +1.0 if seg_type == "L" else -1.0
+
+                            # center of rotation
+                            lx, ly = left(cur_yaw)
+                            if seg_type == "L":
+                                cx = cur_x + r * lx
+                                cy = cur_y + r * ly
+                            else:
+                                cx = cur_x - r * lx
+                                cy = cur_y - r * ly
+
+                            # vector from center to current position
+                            vx = cur_x - cx
+                            vy = cur_y - cy
+
+                            n = max(1, int(np.ceil(abs(dtheta) * r / ds)))  # ~ arc length / ds
+                            step_ang = sign * (abs(dtheta) / n)
+
+                            for _ in range(n):
+                                vx, vy = rot2(vx, vy, step_ang)
+                                cur_x = cx + vx
+                                cur_y = cy + vy
+                                cur_yaw += step_ang
+                                pts.append((cur_x, cur_y))
+
+                        else:
+                            raise ValueError(f"Unknown arcline segment type '{seg_type}' in shape='{shape}'")
+
+                    pts_t = torch.from_numpy(np.asarray(pts, dtype=np.float32)).float()
+
+                # If we ended up with too few points, make it non-empty but safe
+                if pts_t.shape[0] < 2:
+                    centerline_position[i] = pts_t[:, :2]
+                    centerline_heading[i] = torch.zeros(0)
+                    centerline_length[i] = torch.zeros(0)
+                    num_centerlines[i] = pts_t.shape[0]
+                    lane_position[i] = pts_t[:1, :2].mean(dim=0) if pts_t.shape[0] > 0 else torch.zeros(2)
+                    lane_heading[i] = 0.0
+                    lane_length[i] = 0.0
+                else:
+                    pts_t = pts_t[:, :2]  # [M, 2]
+
+                    deltas = pts_t[1:] - pts_t[:-1]                 # [M-1, 2]
+                    headings = torch.atan2(deltas[:, 1], deltas[:, 0])
+                    seg_len = torch.norm(deltas, dim=-1)            # [M-1]
+
+                    centerline_position[i] = pts_t
+                    centerline_heading[i] = headings
+                    centerline_length[i] = seg_len
+                    num_centerlines[i] = pts_t.shape[0]
+
+                    lane_position[i] = pts_t.mean(dim=0)
+                    lane_heading[i] = headings.mean()
+                    lane_length[i] = seg_len.sum()
+
+                    lane_is_intersection[i] = int(lane_record.get('is_intersection', False))
+                    lane_turn_direction[i] = int(lane_record.get('turn_direction', 'NONE') != 'NONE')
+                    lane_traffic_control[i] = int(lane_record.get('has_traffic_control', False))
+
+                    # predecessor / successor
+                    for pred in lane_record.get('predecessors', []):
+                        if pred in lane_token_to_idx:
+                            lane_predecessor_edge_index.append(
+                                [lane_token_to_idx[pred], i]
+                            )
+
+                    for succ in lane_record.get('successors', []):
+                        if succ in lane_token_to_idx:
+                            lane_successor_edge_index.append(
+                                [i, lane_token_to_idx[succ]]
+                            )
+
+                    # adjacent lanes (left / right)
+                    for adj in lane_record.get('adjacent_lanes', []):
+                        if adj in lane_token_to_idx:
+                            lane_adjacent_edge_index.append(
+                                [i, lane_token_to_idx[adj]]
+                            )
+            # pack tensors
+            data['lane'] = {
+                'num_nodes': num_lanes,
+                'position': lane_position,
+                'heading': lane_heading,
+                'length': lane_length,
+                'is_intersection': lane_is_intersection,
+                'turn_direction': lane_turn_direction,
+                'traffic_control': lane_traffic_control
+            }
+
+            data['centerline'] = {
+                'position': centerline_position,
+                'heading': centerline_heading,
+                'length': centerline_length,
+                'num_nodes': num_centerlines
+            }
+
+            data[('centerline', 'lane')] = {
+                'edge_index': torch.stack([
+                    torch.arange(num_lanes).repeat_interleave(num_centerlines),
+                    torch.cat([torch.arange(n) for n in num_centerlines])
+                ], dim=0)
+            }
+
+            data[('lane', 'lane')] = {
+                'adjacent_edge_index': torch.tensor(lane_adjacent_edge_index).T
+                if len(lane_adjacent_edge_index) > 0 else torch.empty(2, 0, dtype=torch.long),
+                'predecessor_edge_index': torch.tensor(lane_predecessor_edge_index).T
+                if len(lane_predecessor_edge_index) > 0 else torch.empty(2, 0, dtype=torch.long),
+                'successor_edge_index': torch.tensor(lane_successor_edge_index).T
+                if len(lane_successor_edge_index) > 0 else torch.empty(2, 0, dtype=torch.long),
+            }
+
+            map_features.append(data)
+            break
+
+        if save:
+            torch.save(map_features, os.path.join(pth))
+        
+        raise NotImplementedError
+        
+        return map_features

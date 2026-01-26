@@ -145,7 +145,7 @@ def plot_trajectories(hist_traj, hist_masks, pred_traj, target_traj, target_mask
     #plt.show()
 
 @torch.no_grad()
-def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, device, epoch, run_name, out_slice, together=True, sub_name='run'):
+def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, device, epoch, run_name, out_slice, together=True, sub_name='run', filename=None):
     """
     Run the model on a fixed batch and plot the first few agents' trajectories.
     Called before training/resume (with the current model state) and after each epoch.
@@ -199,6 +199,10 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
             pred_xy = pred[s, rdm_agents[s], :, :2].detach().cpu()
             types = obs_types[s, rdm_agents[s]]
 
+            if filename is None:
+                filename_ = f"{run_name}_debug_epoch{epoch}_sample{s}"
+            else:
+                filename_ = f"{filename}_sample{s}"
             plot_trajectories(
                 hist_xy,
                 hist_mask_cpu,
@@ -208,7 +212,7 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                 obs_types=types,
                 title=f"[Debug] epoch {epoch} sample {s}",
                 RUN_NAME=run_name,
-                filename=f"{run_name}_debug_epoch{epoch}_sample{s}",
+                filename=filename_,
                 sub_name=sub_name
             )
     else:
@@ -221,6 +225,10 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                 pred_xy = pred[s, a, :, :2].detach().cpu().unsqueeze(0)
                 types = np.expand_dims(np.array(obs_types[s, a]), 0)
 
+                if filename is None:
+                    filename_ = f"{run_name}_debug_epoch{epoch}_sample{s}_agent{a}"
+                else:
+                    filename_ = f"{filename}_sample{s}_agent{a}"
                 plot_trajectories(
                     hist_xy,
                     hist_mask_cpu,
@@ -230,12 +238,12 @@ def plot_debug_batch(train_state, dataset, batch, rdm_agents, rdm_samples, devic
                     obs_types=types,
                     title=f"[Debug] agent {a} @ epoch {epoch} sample {s}",
                     RUN_NAME=run_name,
-                    filename=f"{run_name}_debug_epoch{epoch}_sample{s}_agent{a}",
+                    filename=filename_,
                     sub_name=sub_name,
                 )
 
 @torch.no_grad()
-def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_slice, goal_num_agents=8, goal_num_samples=5, together=True, sub_name='run'):
+def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_slice, goal_num_agents=8, goal_num_samples=5, together=True, sub_name='run', filename=None, valid_batch_idxs=None, valid_agent_idxs=None):
     """
     together: plot all agents on top of each other if true
     """
@@ -249,17 +257,18 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
     else:
         targets_mask = targets_mask.to(device)
     sample_idx = batch["idx"]                            # [B]
-    obs_types = dataset.get_obs_type(sample_idx)      # [B, A]    
-    pred = outputs["pred"]
+    obs_types = dataset.get_obs_type(sample_idx)      # [B, A]  
+    pred = outputs["pred"] if isinstance(outputs, dict) else outputs
     
     B, _, A, _ = obs_pose.shape
     goal_num_agents = min(goal_num_agents, A)
     goal_num_samples = min(goal_num_samples, B)
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
-    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples)
-    if valid_batch_idxs is None:
-        return
+    if valid_batch_idxs is None and valid_agent_idxs is None:
+        valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples)
+        if valid_batch_idxs is None:
+            return
 
     if together:
         for s in valid_batch_idxs:
@@ -270,6 +279,10 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
             pred_xy = pred[s, valid_agent_idxs[s], :, :2].detach().cpu()
             types = obs_types[s, valid_agent_idxs[s]]
 
+            if filename is None:
+                filename_ = f"{run_name}_test_batch{batch_num}_sample{s}"
+            else:
+                filename_ = f"{filename}_batch{batch_num}_sample{s}"
             plot_trajectories(
                 hist_xy,
                 hist_mask_cpu,
@@ -279,7 +292,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
                 obs_types=types,
                 title=f"[Test] batch {batch_num} sample {s}",
                 RUN_NAME=run_name,
-                filename=f"{run_name}_test_batch_{batch_num}_sample{s}",
+                filename=filename_,
                 sub_name=sub_name,
             )
     else:
@@ -292,6 +305,10 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
                 pred_xy = pred[s, a, :, :2].detach().cpu().unsqueeze(0)
                 types = np.expand_dims(np.array(obs_types[s, a]), 0)
 
+                if filename is None:
+                    filename_ = f"{run_name}_test_batch{batch_num}_sample{s}_agent{a}"
+                else:
+                    filename_ = f"{filename}_batch{batch_num}_sample{s}_agent{a}"
                 plot_trajectories(
                     hist_xy,
                     hist_mask_cpu,
@@ -301,6 +318,8 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
                     obs_types=types,
                     title=f"[Test] agent {a} @ batch {batch_num} sample {s}",
                     RUN_NAME=run_name,
-                    filename=f"{run_name}_test_batch{batch_num}_sample{s}_agent{a}",
+                    filename=filename_,
                     sub_name=sub_name,
                 )
+
+    return valid_batch_idxs, valid_agent_idxs

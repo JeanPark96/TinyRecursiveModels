@@ -125,6 +125,9 @@ class ACTLossHeadNuScenes(nn.Module):
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
 
+    def decode(self, *args, **kwargs):
+        return self.model.decode(*args, **kwargs)
+
     def forward(
         self,
         return_keys: Sequence[str],
