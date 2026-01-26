@@ -28,6 +28,7 @@ from nuscenes_dataset import NuScenesDataset, custom_collate
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, plot_test_batch
+from utils.metrics import compute_metrics
 from models.losses import ACTLossHeadNuScenes
 import random
 import numpy as np
@@ -86,34 +87,6 @@ def cosine_schedule_with_warmup_lr_lambda(
     progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
     return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
 
-# def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
-#     return cosine_schedule_with_warmup_lr_lambda(
-#         current_step=train_state.step,
-#         base_lr=base_lr,
-#         num_warmup_steps=round(config.lr_warmup_steps),
-#         num_training_steps=train_state.total_steps,
-#         min_ratio=config.lr_min_ratio
-#     )
-
-@torch.no_grad()
-def compute_ade_fde(pred, targets, targets_mask, out_slice=2):
-    """
-    Returns scalar ADE/FDE (averaged over valid agents+timesteps).
-    """
-    tgt = targets[..., :out_slice].permute(0, 2, 1, 3).contiguous()         # [B,A,H,2]
-    m = targets_mask.permute(0, 2, 1).to(pred.dtype).contiguous()           # [B,A,H]
-
-    pred_xy = pred[..., :out_slice]
-    dist = torch.linalg.norm(pred_xy - tgt, dim=-1)                         # [B,A,H]
-
-    ade = (dist * m).sum() / (m.sum() + 1e-6)
-
-    # FDE: last horizon step only
-    dist_last = dist[:, :, -1]
-    m_last = m[:, :, -1]
-    fde = (dist_last * m_last).sum() / (m_last.sum() + 1e-6)
-
-    return ade.item(), fde.item()
 
 def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     if ood:
@@ -168,7 +141,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     else:
         logger.log("Running Test...")
     train_state.model.eval()
-    ade_sum = fde_sum = ade_real_sum = fde_real_sum = loss_sum = 0.0
+    ade_sum = fde_sum = ade_real_sum = fde_real_sum = loss_sum = mr_sum = 0.0
     n = 0
 
     with torch.no_grad():
@@ -180,6 +153,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             obs_mask = batch["obs_mask"].to(device)
             targets = batch["targets"].to(device)
             targets_mask = batch.get("targets_mask", None)
+            targets_idx = batch.get("targets_idx", None).to(device)
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -191,6 +165,13 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                 "obs_mask": obs_mask,
                 "targets": targets,
                 "targets_mask": targets_mask,
+                "targets_idx": targets_idx,
+                "camera_F_features": batch.get("camera_F_features", None).to(device),
+                "camera_FL_features": batch.get("camera_FL_features", None).to(device),
+                "camera_FR_features": batch.get("camera_FR_features", None).to(device),
+                "camera_B_features": batch.get("camera_B_features", None).to(device),
+                "camera_BL_features": batch.get("camera_BL_features", None).to(device),
+                "camera_BR_features": batch.get("camera_BR_features", None).to(device),
             }
 
             with torch.device("cuda"):
@@ -235,15 +216,15 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                     
             # calc extra metrics
             pred = outputs["pred"]
-            ade, fde = compute_ade_fde(
-                pred, targets, targets_mask, out_slice=config_dict["out_slice"]
+            ade, fde, _ = compute_metrics(
+                pred, targets, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
             targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-            ade_real, fde_real = compute_ade_fde(
-                pred_xy_denorm, targets_xy_denorm, targets_mask, out_slice=config_dict["out_slice"]
+            ade_real, fde_real, mr = compute_metrics(
+                pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
             )
 
             # log metrics
@@ -251,6 +232,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             fde_sum += fde
             ade_real_sum += ade_real
             fde_real_sum += fde_real
+            mr_sum  += mr
             loss_sum += reduced_metrics['val/loss']
             n += 1
 
@@ -258,6 +240,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     ave_fde = fde_sum / max(n, 1)
     ave_ade_real = ade_real_sum / max(n, 1)
     ave_fde_real = fde_real_sum / max(n, 1)
+    avg_mr = mr_sum / max(n, 1)
     ave_loss = loss_sum / max(n, 1)
 
     if ood:
@@ -267,7 +250,8 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             f"ADE: {ave_ade:.4f} | "
             f"FDE: {ave_fde:.4f} | "
             f"Real ADE: {ave_ade_real:.4f} | "
-            f"Real FDE: {ave_fde_real:.4f}"
+            f"Real FDE: {ave_fde_real:.4f} | "
+            f"Miss Rate: {avg_mr:.4f} | "
         )
         logger.log("OOD Complete.")
     else:
@@ -277,36 +261,54 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             f"ADE: {ave_ade:.4f} | "
             f"FDE: {ave_fde:.4f} | "
             f"Real ADE: {ave_ade_real:.4f} | "
-            f"Real FDE: {ave_fde_real:.4f}"
+            f"Real FDE: {ave_fde_real:.4f} | "
+            f"Miss Rate: {avg_mr:.4f} | "
         )
         logger.log("Testing Complete.")
 
 
 def load_dataset(args):
     print("Loading Dataset...")
-        
-    
-    train_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/train.npz'
-    val_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/val.npz'
-    test_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/test.npz'
-    ood_data_pth = f'/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}/ood.npz'
-    
+    if args.use_camera:
+        if args.lidar:
+            args.split_dir = f'cam-bev-{args.split_type}'
+        else:
+            args.split_dir = f'cam-{args.split_type}'
+            filename_prefix = "all_camera_features"
+    root_data = "/home/hlpark/common-data/trm/data"
+    train_data_pth = f'{root_data}/{args.split_dir}/train.npz'
+    test_data_pth = f'{root_data}/{args.split_dir}/test.npz'
+    ood_data_pth = f'{root_data}/{args.split_dir}/ood.npz'
+
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
     
-    train_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_train.h5"
-    val_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_val.h5"
-    test_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_test.h5"
-    ood_vid_feat_path = f"/home/vilin/Rapid_Adapt_SM/src/data/{args.split_type}_resnet_feat18/camera_features_ood.h5"
+    train_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_train.h5"
+    test_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_test.h5"
+    ood_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_ood.h5"
 
         
     print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=train_vid_feat_path)
+    tr_dataset = NuScenesDataset(train_data_pth, root_data, args.n_history,
+                                  args.n_horizon, args.max_obstacles, 
+                                  args.max_predict, args.dynamic_only,
+                                  use_camera=args.use_camera, 
+                                  use_lidar=args.lidar, use_bev=args.bev, 
+                                  use_map=args.map,
+                                  use_preprocessed=args.preprocessed_vid_fea, 
+                                  feature_path=train_vid_feat_path)    
     print('Loaded!')
     stats = tr_dataset.compute_normalization_stats()
     print(f"Computed normalization stats: {stats}")
 
     print(f'Loading test dataset...')
-    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=test_vid_feat_path, norm_stats=stats)
+    test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, 
+                                   args.n_horizon, args.max_obstacles, 
+                                    args.max_predict, args.dynamic_only,
+                                    use_camera=args.use_camera, 
+                                    use_lidar=args.lidar, use_bev=args.bev, 
+                                    use_map=args.map,
+                                    use_preprocessed=args.preprocessed_vid_fea, 
+                                   feature_path=test_vid_feat_path, norm_stats=stats)
     print(f'Loaded! {len(test_dataset)}')
 
     test_dataloader = DataLoader(test_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
@@ -320,7 +322,14 @@ def load_dataset(args):
 
     if 'standard' not in args.split_type:
         print(f'Loading ood dataset...')
-        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=ood_vid_feat_path, norm_stats=stats)
+        ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, 
+                                      args.n_horizon, args.max_obstacles, 
+                                        args.max_predict, args.dynamic_only,
+                                        use_camera=args.use_camera, 
+                                        use_lidar=args.lidar, use_bev=args.bev, 
+                                        use_map=args.map,
+                                        use_preprocessed=args.preprocessed_vid_fea,  
+                                      feature_path=ood_vid_feat_path, norm_stats=stats)
         print(f'Loaded ood dataset! {len(ood_dataset)}')
         ood_dataloader = DataLoader(ood_dataset, batch_size=args.config_batch_size, shuffle=False, collate_fn=custom_collate)
     else:
@@ -330,6 +339,8 @@ def load_dataset(args):
     return test_dataset, ood_dataset, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
 
 if __name__ == "__main__":
+    CAMERA_NAMES = ["F", "FL", "FR", "B", "BL", "BR"]
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
     parser.add_argument("--model_pth", type=str)
@@ -347,21 +358,34 @@ if __name__ == "__main__":
                                              'object-bendy', 'object-ambulance', 'object-police'],)
     
     # modalities (always use pose data, but optionally add extra sensor data)
-    parser.add_argument("--camera", action="store_true", help="Use camera data.")
+    parser.add_argument("--camera", action="append", choices=CAMERA_NAMES, default=[], help=f"Cameras to use {CAMERA_NAMES}")
+    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
-    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
-    
+    parser.add_argument('--map', action='store_true', help='Add map context.')
+
     # task parameters (non-defaults are used for sanity checking and testing)
     parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
     parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
     parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
-    
+    parser.add_argument("--eval_every_n_epochs", type=int, default=10, help='Save eval time by running validation every N epochs')
+    parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
+    parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
+
     args = parser.parse_args()
 
     # update task parameters
     args.n_history = args.history_sec*SAMPLE_FREQ # current time inclusive
     args.n_horizon = args.horizon_sec*SAMPLE_FREQ
+
+    args.use_camera = {k: (k in args.camera) for k in CAMERA_NAMES}
+    # args.cam_names = [CAMERA_KEY_TO_NAME[k] for k in CAMERA_NAMES if args.use_camera[k]]
+    args.cam_names = [k for k in CAMERA_NAMES if args.use_camera[k]]
+    
+    print("Using cameras: ", args.use_camera)
+    print(args.cam_names)
+
+    print(f"n_history: {args.n_history}, n_horizon: {args.n_horizon}")
 
     assert os.path.exists(args.model_pth)
 

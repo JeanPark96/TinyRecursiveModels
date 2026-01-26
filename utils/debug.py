@@ -257,7 +257,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
     goal_num_samples = min(goal_num_samples, B)
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
-    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targetes_mask, goal_num_agents, goal_num_samples)
+    valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples)
     if valid_batch_idxs is None:
         return
 
