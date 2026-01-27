@@ -11,8 +11,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
+# Custom GloVeTokenizer if torchtext does not work
 class GloVeTokenizer:
-    def __init__(self, name='6B', dim=300, cache_dir='/Volumes/biomedicalinformatics_analytics/dev_lab_johnson/open_source_video_datasets/Charades-STA/snag/charades_sta/'):
+    def __init__(self, name='6B', dim=300, cache_dir='/home/hlpark/snag_release/.vector_cache'):
         self.dim = dim
         self.cache_dir = cache_dir
         self.glove_map = {}
@@ -79,6 +80,36 @@ class GloVeTokenizer:
         feats = feats.transpose(0, 1)
         
         return feats
+
+#SnAG provided Tokenizer
+# import torchtext
+# from torchtext.data import get_tokenizer
+# from torchtext.vocab import GloVe
+# class GloVeTokenizer:
+
+#     def __init__(self, name='6B'):
+
+#         self.vocab = GloVe(name=name)
+#         self.tokenizer = get_tokenizer("basic_english")
+
+#     def __call__(self, text, max_len=None):
+#         """
+#         Args:
+#             text (str): text query.
+#             max_len (int): maximum sequence length.
+
+#         Returns:
+#             feats (float tensor, (c, t)): feature sequence.
+#         """
+#         # tokenize by word
+#         ## NOTE: unknown words are assigned zero vector
+#         words = self.tokenizer(text)
+#         feats = self.vocab.get_vecs_by_tokens(words, lower_case_backup=True)
+#         if max_len is not None:
+#             feats = feats[:max_len]
+#         feats = feats.transpose(0, 1)   # (c, t)
+
+#         return feats
 
 class BaseDataset(Dataset):
 
@@ -795,12 +826,12 @@ def worker_init_fn(worker_id, seed=123):
     np.random.seed(worker_seed)
     torch.manual_seed(worker_seed)
 
-def load_dataset(batch_size=16):
+def load_dataset(args, batch_size=16):
     print("Loading Dataset...")
     glove_tokenizer = GloVeTokenizer()
     paths = {
-    "anno_root": "/Volumes/biomedicalinformatics_analytics/dev_lab_johnson/open_source_video_datasets/Charades-STA/snag/charades_sta/annotations",
-    "vid_feat_dir" : ["/Volumes/biomedicalinformatics_analytics/dev_lab_johnson/open_source_video_datasets/Charades-STA/snag/charades_sta/i3d_features/charades/rgb", "/Volumes/biomedicalinformatics_analytics/dev_lab_johnson/open_source_video_datasets/Charades-STA/snag/charades_sta/i3d_features/charades/flow"]
+    "anno_root": f"{args.data_root}/charades_sta/annotations",
+    "vid_feat_dir" : [f"{args.data_root}/charades_sta/i3d_features/charades/rgb", f"{args.data_root}/charades_sta/i3d_features/charades/flow"]
     }
 
     # Standard SnAG Configuration for Fair Comparison
@@ -839,7 +870,7 @@ def load_dataset(batch_size=16):
     train_ds = CharadesSnagAdapter(
         is_training=True,
         tokenizer=glove_tokenizer,
-        anno_file=f"{paths["anno_root"]}/charades_sta_train_split.json",
+        anno_file=f"{paths['anno_root']}/charades_sta_train_split.json",
         vid_feat_dir=paths["vid_feat_dir"], 
         **train_dataset_cfg
         
@@ -847,7 +878,7 @@ def load_dataset(batch_size=16):
     val_ds = CharadesSnagAdapter(
         is_training=False,
         tokenizer=glove_tokenizer,
-        anno_file=f"{paths["anno_root"]}/charades_sta_val_split.json",
+        anno_file=f"{paths['anno_root']}/charades_sta_val_split.json",
         vid_feat_dir=paths["vid_feat_dir"], 
         **val_dataset_cfg
         
@@ -855,7 +886,7 @@ def load_dataset(batch_size=16):
     test_ds = CharadesSnagAdapter(
         is_training=False,
         tokenizer=glove_tokenizer,
-        anno_file=f"{paths["anno_root"]}/charades_sta_test_split.json",
+        anno_file=f"{paths['anno_root']}/charades_sta_test_split.json",
         vid_feat_dir=paths["vid_feat_dir"], 
         **test_dataset_cfg
     )
@@ -893,7 +924,7 @@ def load_dataset(batch_size=16):
         pin_memory=True,
         persistent_workers=True,
     )
-
+    print(f"{len(train_ds)}")
     return train_ds, val_ds, test_ds, tr_dataloader, val_dataloader, test_dataloader
 
 
@@ -961,7 +992,7 @@ def split_charadessta_train_val(
 
     print(f"--- Split Complete ---")
     print(f"Original Train Videos: {len(vids)}")
-    print(f"New Train: {len(new_train_split["train"])} videos ({n_train_samples} queries) -> Saved to {out_train_path}")
-    print(f"New Val:   {len(new_val_split["val"])} videos ({n_val_samples} queries) -> Saved to {out_val_path}")
-    print(f"Test:   {len(test_split["test"])} videos ({n_test_samples} queries) -> Saved to {out_test_path}")
+    print(f"New Train: {len(new_train_split['train'])} videos ({n_train_samples} queries) -> Saved to {out_train_path}")
+    print(f"New Val:   {len(new_val_split['val'])} videos ({n_val_samples} queries) -> Saved to {out_val_path}")
+    print(f"Test:   {len(test_split['test'])} videos ({n_test_samples} queries) -> Saved to {out_test_path}")
 

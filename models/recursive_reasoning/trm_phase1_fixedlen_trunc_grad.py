@@ -9,6 +9,7 @@ from models.layers import SwiGLU, Attention, CastedLinear, CastedEmbedding, rms_
 from models.common import trunc_normal_init_
 import numpy as np
 from models.head import TRM_DenseHead
+from utils.buffer_compat import register_compat_buffer
 
 @dataclass
 class VideoTRM_InnerCarry:
@@ -182,8 +183,12 @@ class TRMLocalizerSync(nn.Module):
 
         self.forward_dtype = getattr(torch, self.cfg.forward_dtype)
 
+        #nn.Buffer compatible with torch 2.10 which is not compatible with torchtext 0.18.0 and torch 2.3.0
+        # we use custom function that detects torch version and select buffer registration method
         self.H_init = nn.Buffer(torch.empty(cfg.num_y_tokens, cfg.hidden_size))
         self.L_init = nn.Buffer(torch.empty(cfg.num_z_tokens, cfg.hidden_size))
+        # register_compat_buffer(self, "H_init", torch.empty(cfg.num_y_tokens, cfg.hidden_size),)
+        # register_compat_buffer(self, "L_init", torch.empty(cfg.num_z_tokens, cfg.hidden_size),)
         trunc_normal_init_(self.H_init, std=0.02)
         trunc_normal_init_(self.L_init, std=0.02)
 
