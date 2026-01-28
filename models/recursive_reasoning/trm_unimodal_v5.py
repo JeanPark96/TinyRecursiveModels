@@ -112,6 +112,7 @@ class TRM_ACT_NuScenes_Block(nn.Module):
         cos_sin: CosSin,
         hidden_states: torch.Tensor,
         token_mask: Optional[torch.Tensor] = None,  # [B, L_total] boolean mask
+        cross_agent = True
     ) -> torch.Tensor:
         if self.config.mlp_t:
             hs = hidden_states.transpose(1, 2)
@@ -119,7 +120,43 @@ class TRM_ACT_NuScenes_Block(nn.Module):
             hs = rms_norm(hs + out, variance_epsilon=self.norm_eps)
             hidden_states = hs.transpose(1, 2)
         else:
-            attn_mask = token_mask[:,None,None,:].expand(-1,1,hidden_states.size(1),-1) # [B, 1, L, L]
+            # attn_mask = token_mask[:,None,None,:].expand(-1,1,hidden_states.size(1),-1) # [B, 1, L, L]
+            exists = token_mask.to(torch.bool)
+            attn_mask = (
+                exists[:, :, None] & exists[:, None, :]
+            )  # [B, L, L]
+            attn_mask = attn_mask[:, None, :, :]  # [B, 1, L, L]
+
+            if not cross_agent:
+                A = self.config.max_obstacles
+                H = self.config.n_history
+                L = A*H+1
+                mask = torch.zeros((L, L), dtype=torch.bool, device=token_mask.device)
+
+                # ---- read-only global token rules ----
+                allow_global_to_all = False
+                allow_all_to_global = True
+
+                if allow_global_to_all:
+                    mask[0, :] = True
+                if allow_all_to_global:
+                    mask[:, 0] = True
+
+                # ---- agent tokens ----
+                agent_ids = (
+                    torch.arange(A, device=token_mask.device)
+                    .repeat_interleave(H)
+                )  # [A*H]
+
+                # shift by 1 because of global token
+                agent_ids = agent_ids + 1  # token indices start at 1
+
+                # allow intra-agent attention
+                same_agent = agent_ids[:, None] == agent_ids[None, :]
+                mask[1:, 1:] = same_agent
+            
+                attn_mask = attn_mask & mask[None,None,:,:].expand(attn_mask.size(0),-1,-1,-1)
+            
             hidden_states = rms_norm(
                 hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attention_mask=attn_mask),
                 variance_epsilon=self.norm_eps,
@@ -285,44 +322,11 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(
+    def decode(
         self,
-        carry: TRM_ACT_NuScenes_InnerCarry,
-        batch: Dict[str, torch.Tensor],
-    ) -> Tuple[TRM_ACT_NuScenes_InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
-
-        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
-
-        input_embeddings, full_mask, last_obs = self._input_embeddings(
-            batch["obs_pose"], batch["obs_mask"]
-        )
-
-        z_H, z_L = carry.z_H, carry.z_L
-
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _ in range(self.config.H_cycles - 1):
-                for _ in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
-                z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
-        # 1 with grad
-        for _ in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
-        z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
-
-        new_carry = TRM_ACT_NuScenes_InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
-
-        # global latent (kept)
-        global_latent = z_H[:, 0]  # [B, D]
-
-        # Q head on global token
-        q_logits = self.q_head(global_latent).to(torch.float32)
-        q_halt_logits, q_continue_logits = q_logits[..., 0], q_logits[..., 1]
-
-        # =================================================================
-        # Query-Based Decoding Implementation
-        # =================================================================
-        
+        z_H,
+        batch
+    ):
         B = z_H.shape[0]
         A = self.config.max_obstacles
         Aout = self.config.max_predict
@@ -330,6 +334,7 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         T_pred = self.config.n_horizon
         D = self.config.hidden_size
         targets_idx = batch["targets_idx"]
+        last_obs = batch["obs_pose"][:, -1].to(self.forward_dtype)  # [B, A, 7]
         assert Aout <= A
 
         # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
@@ -384,7 +389,115 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         last_step_mask = torch.gather(batch["obs_mask"][:, -1], dim=1, index=targets_idx).to(torch.bool)  # [B, Aout]
         pred = pred * last_step_mask[:, :, None, None].to(pred.dtype)
 
-        return new_carry, pred, (q_halt_logits, q_continue_logits), global_latent
+        return pred
+
+    def forward(
+        self,
+        carry: TRM_ACT_NuScenes_InnerCarry,
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[TRM_ACT_NuScenes_InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+
+        cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
+
+        input_embeddings, full_mask, last_obs = self._input_embeddings(
+            batch["obs_pose"], batch["obs_mask"]
+        )
+
+        z_H, z_L = carry.z_H, carry.z_L
+        pred_recursions = [z_H]
+
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _ in range(self.config.H_cycles - 1):
+                for _ in range(self.config.L_cycles):
+                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask, cross_agent=False)
+                z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask, cross_agent=True)
+                pred_recursions.append(z_H)
+        # 1 with grad
+        for _ in range(self.config.L_cycles):
+            z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask, cross_agent=False)
+        z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask, cross_agent=True)
+        pred_recursions.append(z_H)
+
+        pred_recursions = torch.stack(pred_recursions, dim=0)
+
+        new_carry = TRM_ACT_NuScenes_InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+
+        # global latent (kept)
+        global_latent = z_H[:, 0]  # [B, D]
+
+        # Q head on global token
+        q_logits = self.q_head(global_latent).to(torch.float32)
+        q_halt_logits, q_continue_logits = q_logits[..., 0], q_logits[..., 1]
+
+        # =================================================================
+        # Query-Based Decoding Implementation
+        # =================================================================
+        
+        pred = self.decode(z_H, batch)
+
+        # B = z_H.shape[0]
+        # A = self.config.max_obstacles
+        # Aout = self.config.max_predict
+        # T_obs = self.config.n_history
+        # T_pred = self.config.n_horizon
+        # D = self.config.hidden_size
+        # targets_idx = batch["targets_idx"]
+        # assert Aout <= A
+
+        # # 1. Separate tokens from global. z_H is [B, global + (A*T_obs), D]
+        # agent_tokens = z_H[:, self.global_len:] # [B, A*T_obs, D]
+
+        # # 2. Reshape to independent sequences: [B, Aout*T_obs, D]
+        # #    This groups all history for a specific agent together.
+        # history_kv = agent_tokens.contiguous().view(B, A, T_obs, D)
+        # if Aout < A:
+        #     history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
+        # history_kv = history_kv.view(B * Aout, T_obs, D)
+
+        # # 3. Expand future queries: [B, Aout*T_pred, D] and condition on agent information
+        # # history_kv: [B*Aout, T_obs, D]
+
+        # agent_summary = history_kv[:, -1]                 # [B*Aout, D]
+        # agent_cond = self.agent_proj(agent_summary)       # [B*Aout, D]
+
+        # base_queries = self.future_queries.expand(B * Aout, -1, -1, -1)
+        # base_queries = base_queries.reshape(B * Aout, T_pred, D)
+
+        # queries = base_queries + agent_cond[:, None, :]   # [B*Aout, T_pred, D]
+
+        # # 4. Cross Attention: Future queries attend to history
+        # #    attn_out: [B*Aout, T_pred, D]
+        # attn_out, _ = self.decoder_attn(
+        #     query=queries,
+        #     key=history_kv,
+        #     value=history_kv,
+        # )
+
+        # attn_out = attn_out + self.self_gate * agent_cond[:,None,:]
+
+        # # 5. Project to output dim: [B, Aout*T_pred, out_dim]
+        # pred_flat = self.output_proj(attn_out)
+
+        # # 6. Reshape back to batch format: [B, A, T_pred, out_dim]
+        # pred = pred_flat.view(B, Aout, T_pred, self.config.out_dim)
+
+        # # =================================================================
+
+        # # delta decoding for first out_slice dims
+        # if self.config.predict_delta and self.config.out_slice > 0:
+        #     last_obs_out = torch.gather(last_obs, dim=1, index=targets_idx[:,:,None].expand(-1,-1,last_obs.size(2))) # [B, Aout, 7]
+        #     base = last_obs_out[:, :, :self.config.out_slice].to(pred.dtype)  # [B, A, out_slice]
+        #     pred_slice = pred[..., :self.config.out_slice]
+        #     # pred = torch.cat([base[:, :, None, :] + pred_slice, pred[..., self.config.out_slice :]], dim=-1)
+        #     disp = torch.cumsum(pred_slice, dim=2)
+        #     pred = torch.cat([base[:, :, None, :] + disp, pred[..., self.config.out_slice :]], dim=-1)
+
+        # # zero-out agents that don't exist at last obs step
+        # last_step_mask = torch.gather(batch["obs_mask"][:, -1], dim=1, index=targets_idx).to(torch.bool)  # [B, Aout]
+        # pred = pred * last_step_mask[:, :, None, None].to(pred.dtype)
+
+        return new_carry, pred, (q_halt_logits, q_continue_logits), global_latent, pred_recursions
 
 
 # =========================
@@ -407,6 +520,9 @@ class TRM_ACT_NuScenes(nn.Module):
             current_data={k: torch.empty_like(v) for k, v in batch.items()},
             prev_loss=torch.full((B,), float('inf'), dtype=torch.float32, device=device)
         )
+
+    def decode(self, *args, **kwargs):
+        return self.inner.decode(*args, **kwargs)
 
     def forward(
         self,
@@ -431,7 +547,7 @@ class TRM_ACT_NuScenes(nn.Module):
             for k, v in carry.current_data.items()
         }
 
-        new_inner_carry, pred, (q_halt_logits, q_continue_logits), global_latent = self.inner(
+        new_inner_carry, pred, (q_halt_logits, q_continue_logits), global_latent, pred_recursions = self.inner(
             new_inner_carry, new_current_data
         )
 
@@ -440,6 +556,7 @@ class TRM_ACT_NuScenes(nn.Module):
             "global_latent": global_latent,      # [B, D]
             "q_halt_logits": q_halt_logits,      # [B]
             "q_continue_logits": q_continue_logits,
+            "pred_recursions": pred_recursions, # [H_cycles, B, A*H+1, D]
         }
 
         with torch.no_grad():

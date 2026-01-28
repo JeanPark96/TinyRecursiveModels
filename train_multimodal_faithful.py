@@ -581,15 +581,11 @@ def load_dataset(args):
     #root_data = "/home/hlpark/common-data/trm/data"
     train_data_pth = f'{root_data}/{args.split_dir}/train.npz'
     val_data_pth = f'{root_data}/{args.split_dir}/val.npz'
-    test_data_pth = f'{root_data}/{args.split_dir}/test.npz'
-    ood_data_pth = f'{root_data}/{args.split_dir}/ood.npz'
 
     raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
     
     train_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_train.h5"
     val_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_val.h5"
-    test_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_test.h5"
-    ood_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_ood.h5"
 
         
     print(f'Loading train dataset...')
@@ -616,9 +612,6 @@ def load_dataset(args):
                                   feature_path=val_vid_feat_path, norm_stats=stats)
     print(f'Loaded! {len(val_dataset)}')
 
-    # print(f'Loading test dataset...')
-    # test_dataset = NuScenesDataset(test_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=test_vid_feat_path, norm_stats=stats)
-    # print(f'Loaded! {len(test_dataset)}')
     test_dataset = None
     tr_dataloader = DataLoader(tr_dataset, 
                                 batch_size=args.config_batch_size, 
@@ -637,14 +630,6 @@ def load_dataset(args):
                                 persistent_workers=True,
                                 prefetch_factor=2)
     test_dataloader = None
-    # test_dataloader = DataLoader(test_dataset,
-    #                             batch_size=args.config_batch_size, 
-    #                             shuffle=False, 
-    #                             collate_fn=custom_collate,
-    #                             num_workers=4,
-    #                             pin_memory=True,
-    #                             persistent_workers=True,
-    #                             prefetch_factor=2)
 
     pos_mean = stats["pos_mean"]
     pos_std  = stats["pos_std"]
@@ -654,42 +639,17 @@ def load_dataset(args):
     print("Denormalize params: ", mean_xy, std_xy)
 
     if 'standard' not in args.split_type:
-        # print(f'Loading ood dataset...')
-        # ood_dataset = NuScenesDataset(ood_data_pth, raw_data_dir, args.n_history, args.n_horizon, args.max_obstacles, use_camera=args.use_camera, use_lidar=args.lidar, use_bev=args.bev, use_preprocessed=args.preprocessed_vid_fea, feature_path=ood_vid_feat_path, norm_stats=stats)
-        # print(f'Loaded ood dataset! {len(ood_dataset)}')
-        # ood_dataloader = DataLoader(ood_dataset, 
-        #                             batch_size=args.config_batch_size, 
-        #                             shuffle=False, 
-        #                             collate_fn=custom_collate,
-        #                             num_workers=4,
-        #                             pin_memory=True,
-        #                             persistent_workers=True,
-        #                             prefetch_factor=2)
         ood_dataset = None
         ood_dataloader = None
     else:
         ood_dataset = None
         ood_dataloader = None
 
-    #uncomment to check data type
-    # sample = tr_dataset[0]
-    # for k, v in sample.items():
-    #     if torch.is_tensor(v):
-    #         print(k, v.dtype, v.shape)
     return tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
 
 if __name__ == "__main__":
-    # CAMERA_NAMES = ["camera_F", "camera_FL", "camera_FR", "camera_B", "camera_BL", "camera_BR"]
     CAMERA_NAMES = ["F", "FL", "FR", "B", "BL", "BR"]
-    # CAMERA_KEY_TO_NAME = {
-    #     "camera_F":  "F",
-    #     "camera_FL": "FL",
-    #     "camera_FR": "FR",
-    #     "camera_B": "B",   # note: BF → B
-    #     "camera_BL": "BL",
-    #     "camera_BR": "BR",
-    # }
-    
+  
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
     parser.add_argument("--epochs", type=int, default=10)

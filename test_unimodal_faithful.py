@@ -127,9 +127,9 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     n = 0
 
     with torch.no_grad():
-        for b, batch in tqdm(enumerate(dataloader)):
-            if b % 10 == 0:
-                print(f'Batch {b}')
+        for b, batch in enumerate(tqdm(dataloader)):
+            # if b % 10 == 0:
+            #     print(f'Batch {b}')
 
             obs_pose = batch["obs_pose"].to(device)
             obs_mask = batch["obs_mask"].to(device)
@@ -155,14 +155,17 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
 
             # Forward
             inference_steps = 0
+            supervisions = []
             while True:
                 carry, loss, metrics, outputs, all_finish = train_state.model(
                     carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                 )
                 inference_steps += 1
+                supervisions.append(outputs["pred"])
 
                 if all_finish:
                     break
+            supervisions = torch.stack(supervisions, dim=0)
 
             # plot batch
             plot_test_batch(
@@ -214,25 +217,43 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             n += 1
 
             # plot recursions
-            pred_recursions = outputs["pred_recursions"] # [H_cycles, B, A*H+1, D]
-            # print(pred_recursions[:,0,0,0])
-            # raise NotImplementedError
-            valid_batch_idxs = valid_agent_idxs = None
-            for cycle in range(pred_recursions.size(0)):
-                recursion_out = train_state.model.decode(pred_recursions[cycle], model_input)
-                valid_batch_idxs, valid_agent_idxs = plot_test_batch(
-                    dataset,
-                    batch,
-                    b,
-                    recursion_out,
-                    device,
-                    run_name=f'recursions_{RUN_NAME}',
-                    out_slice=config_dict["out_slice"],
-                    sub_name=args.tboard_name,
-                    filename=f'recursion{cycle}',
-                    valid_batch_idxs=valid_batch_idxs,
-                    valid_agent_idxs=valid_agent_idxs,
-                )
+            if b == 0:
+                pred_recursions = outputs["pred_recursions"] # [H_cycles, B, A*H+1, D]
+                # print(pred_recursions[:,0,0,0])
+                # raise NotImplementedError
+                valid_batch_idxs = valid_agent_idxs = None
+                for cycle in range(pred_recursions.size(0)):
+                    recursion_out = train_state.model.decode(pred_recursions[cycle], model_input)
+                    valid_batch_idxs, valid_agent_idxs = plot_test_batch(
+                        dataset,
+                        batch,
+                        b,
+                        recursion_out,
+                        device,
+                        run_name=f'recursions_{RUN_NAME}',
+                        out_slice=config_dict["out_slice"],
+                        sub_name=args.tboard_name,
+                        filename=f'recursion{cycle}',
+                        valid_batch_idxs=valid_batch_idxs,
+                        valid_agent_idxs=valid_agent_idxs,
+                    )
+
+                valid_batch_idxs = valid_agent_idxs = None
+                for cycle in range(supervisions.size(0)):
+                    supervision_out = supervisions[cycle]
+                    valid_batch_idxs, valid_agent_idxs = plot_test_batch(
+                        dataset,
+                        batch,
+                        b,
+                        supervision_out,
+                        device,
+                        run_name=f'supervisions_{RUN_NAME}',
+                        out_slice=config_dict["out_slice"],
+                        sub_name=args.tboard_name,
+                        filename=f'supervision{cycle}',
+                        valid_batch_idxs=valid_batch_idxs,
+                        valid_agent_idxs=valid_agent_idxs,
+                    )
 
     ave_ade = ade_sum / max(n, 1)
     ave_fde = fde_sum / max(n, 1)
@@ -249,7 +270,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             f"FDE: {ave_fde:.4f} | "
             f"Real ADE: {ave_ade_real:.4f} | "
             f"Real FDE: {ave_fde_real:.4f} | "
-            f"Miss rate: {val_mr:.2f}"
+            f"Miss rate: {mr:.4f}"
         )
         logger.log("OOD Complete.")
     else:
@@ -259,7 +280,8 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             f"ADE: {ave_ade:.4f} | "
             f"FDE: {ave_fde:.4f} | "
             f"Real ADE: {ave_ade_real:.4f} | "
-            f"Real FDE: {ave_fde_real:.4f}"
+            f"Real FDE: {ave_fde_real:.4f} | "
+            f"Miss rate: {mr:.4f}"
         )
         logger.log("Testing Complete.")
 

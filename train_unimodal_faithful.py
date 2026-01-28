@@ -36,7 +36,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v5 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -50,7 +50,7 @@ importlib.reload(trm_unimodal)
 #     TRM_ACT_NuScenes_Config
 # )
 importlib.reload(trm_unimodal)
-from models.recursive_reasoning.trm_unimodal_v4 import (
+from models.recursive_reasoning.trm_unimodal_v5 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -217,8 +217,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "time_dim": 16,
             "expansion": 2.0,
             "num_heads": 4,
-            "H_cycles": 3,
-            "L_cycles": 6,
+            "H_cycles": args.H_cycles,
+            "L_cycles": args.L_cycles,
             "H_layers": 0,
             "L_layers": 2,
             "pos_encodings": "none",  # can switch to "rope" later
@@ -424,6 +424,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     # Forward
                     inference_steps = 0
                     while True:
+                        # print(inference_steps+1)
                         carry, loss, metrics, outputs, all_finish = train_state.model(
                             carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                         )
@@ -552,6 +553,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         sub_name=args.tboard_name,
                     )
 
+        # if epoch == 2:
+        #     raise NotImplementedError
 
         logger.log("-" * 30)
 
@@ -569,6 +572,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr_schedule", action="store_true", help="Use learning rate scheduler")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--halt_max_steps", type=int, default=1)
+    parser.add_argument("--H_cycles", type=int, default=3)
+    parser.add_argument("--L_cycles", type=int, default=6)
     parser.add_argument("--config_batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=4501)
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint if available")
