@@ -114,7 +114,7 @@ def train_batch(train_state: TrainState, batch: Any):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=["pred"])
+    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=["pred", "pred_recursions"])
 
     ((1 / batch_size) * loss).backward()
             
@@ -152,10 +152,10 @@ def train_batch(train_state: TrainState, batch: Any):
 
 def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy):
     RUN_NAME = args.run_name
-    LOG_DIR = "logs"
+    LOG_DIR = os.path.join("logs", RUN_NAME)
     CKPT_DIR = "checkpoints"
     TBOARD_DIR = "tboard"
-    run_ckpt_dir = os.path.join(CKPT_DIR, RUN_NAME)
+    run_ckpt_dir = os.path.join(CKPT_DIR, RUN_NAME, args.tboard_name)
     os.makedirs(run_ckpt_dir, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(TBOARD_DIR, exist_ok=True)
@@ -436,7 +436,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     inference_steps = 0
                     while True:
                         carry, loss, metrics, outputs, all_finish = train_state.model(
-                            carry=carry, batch=model_input, return_keys=["pred"]
+                            carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                         )
                         inference_steps += 1
 
@@ -577,7 +577,8 @@ def load_dataset(args):
         else:
             args.split_dir = f'cam-{args.split_type}'
             filename_prefix = "all_camera_features"
-    root_data = "/home/hlpark/common-data/trm/data"
+    root_data = "/home/vilin/Rapid_Adapt_SM/src/data"
+    #root_data = "/home/hlpark/common-data/trm/data"
     train_data_pth = f'{root_data}/{args.split_dir}/train.npz'
     val_data_pth = f'{root_data}/{args.split_dir}/val.npz'
     test_data_pth = f'{root_data}/{args.split_dir}/test.npz'
