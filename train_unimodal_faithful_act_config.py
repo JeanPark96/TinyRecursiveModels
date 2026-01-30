@@ -24,30 +24,34 @@ from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 
 # new imports
-from nuscenes_dataset import NuScenesDataset, custom_collate
+from nuscenes_dataset import load_dataset
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
 from utils.metrics import compute_metrics
-from models.losses import ACTLossHeadNuScenes
+from models.act_losses import ACTLossHeadNuScenes
 import random
 import numpy as np
 import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_multimodal as trm_multimodal
+import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
+from utils.halt_helper import load_yaml, build_act_head_kwargs_from_yaml
 
+importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
+
 # from models.recursive_reasoning.trm_unimodal_v2 import (
 #     TRM_ACT_NuScenes,
 #     TRM_ACT_NuScenes_Config
 # )
-from models.recursive_reasoning.trm_multimodal import (
+importlib.reload(trm_unimodal)
+from models.recursive_reasoning.trm_unimodal_v5 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -98,7 +102,6 @@ def compute_lr(base_lr: float, train_state: TrainState):
         min_ratio=train_state.optimizer_lr_min_ratio
     )
 
-
 def train_batch(train_state: TrainState, batch: Any):
     train_state.step += 1
     # if train_state.step > train_state.total_steps:  # At most train_total_steps
@@ -114,7 +117,9 @@ def train_batch(train_state: TrainState, batch: Any):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
-    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=["pred", "pred_recursions"])
+    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry,
+                                                                     batch=batch,
+                                                                     return_keys=["pred", "pred_recursions"])
 
     ((1 / batch_size) * loss).backward()
             
@@ -171,6 +176,16 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     mean_xy = mean_xy.to(device)
     std_xy = std_xy.to(device)
 
+    # load halt config file
+    halt_cfg_raw = load_yaml(args.halt_config)
+    act_head_kwargs = build_act_head_kwargs_from_yaml(halt_cfg_raw)
+
+    if act_head_kwargs["denorm"]:
+        act_head_kwargs["std_xy"] = std_xy
+        act_head_kwargs["mean_xy"] = mean_xy
+    if args.halt_verbose:
+        act_head_kwargs["verbose"] = True
+
     # --- Infer key dims from a real batch (prevents config mismatch) ---
     sample = next(iter(tr_dataloader))
     # n_history = sample["obs_pose"].shape[1]
@@ -204,7 +219,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "in_dim": 7,
             "out_dim": 2,          # predict x,y
             "out_slice": 2,        # supervise x,y
-            "predict_delta": False,
+            "predict_delta": True,
 
             "global_len": 1,       # keep global latent token
             "seq_len": args.max_obstacles * args.n_history,
@@ -213,8 +228,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "time_dim": 16,
             "expansion": 2.0,
             "num_heads": 4,
-            "H_cycles": 3,
-            "L_cycles": 6,
+            "H_cycles": args.H_cycles,
+            "L_cycles": args.L_cycles,
             "H_layers": 0,
             "L_layers": 2,
             "pos_encodings": "none",  # can switch to "rope" later
@@ -225,11 +240,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
             "forward_dtype": "float32",
             "mlp_t": False,
-
-            "num_cameras": len(args.cam_names),         
-            "cam_names": args.cam_names,
-            "use_last_vis_frame" : True 
-
+            "halt_config_name": args.halt_config
         }
 
         with open(os.path.join("./config", f"{RUN_NAME}.json"), "w") as f:
@@ -239,7 +250,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             print(f"No checkpoint found at {last_ckpt_path}; starting from scratch.")
 
     # Initialize Logger
-    logger = Logger(LOG_DIR, RUN_NAME, config_dict)
+    logger = Logger(LOG_DIR, args.tboard_name, config_dict)
     logger.log("Loading Dataset...")
     logger.log(f"Dataset Loaded. Train samples: {len(tr_dataset)}, Val samples: {len(val_dataset)}")
 
@@ -250,8 +261,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         )
     
     # Set up tensorboard
-    datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
-    tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{datetimestr}'))
+    if args.tboard_name is None:
+        datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+        tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{datetimestr}'))
+    else:
+        tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{args.tboard_name}'))
 
     # --- Model & optimizer ---
     logger.log("Initializing Model...")
@@ -271,12 +285,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         ood_debug_batch, ood_debug_idx, ood_rdm_agents, ood_rdm_samples = select_debug_batch(ood_dataloader, seed=args.seed)
         logger.log(f"Selected ood batch index {debug_idx} as debug batch for plotting.")
 
+
     # Train state
     train_state = TrainState(
         step=0,
         total_steps=0, # unused for now
-
-        model=ACTLossHeadNuScenes(model=model),
+        model=ACTLossHeadNuScenes(model=model, 
+                                    **act_head_kwargs),
         optimizers=[optimizer],
         optimizer_lrs=[args.lr],
         optimizer_lr_schedule=args.lr_schedule,
@@ -295,7 +310,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         device,
         epoch=start_epoch,
         run_name=f'debug_{RUN_NAME}_val',
-        out_slice=config_dict["out_slice"]
+        out_slice=config_dict["out_slice"],
+        sub_name=args.tboard_name,
     )
 
     # Training Loop
@@ -317,9 +333,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
             obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
             targets = batch["targets"].to(device)                # [B, Fut, A, 7]
-            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]  
-            targets_idx = batch.get("targets_idx", None).to(device)
-    
+            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
+            targets_idx = batch.get("targets_idx", None).to(device)        # [B, Aout]
             if targets_mask is None:
                 targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
             else:
@@ -331,12 +346,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                 "targets": targets,
                 "targets_mask": targets_mask,
                 "targets_idx": targets_idx,
-                "camera_F_features": batch.get("camera_F_features", None).to(device),
-                "camera_FL_features": batch.get("camera_FL_features", None).to(device),
-                "camera_FR_features": batch.get("camera_FR_features", None).to(device),
-                "camera_B_features": batch.get("camera_B_features", None).to(device),
-                "camera_BL_features": batch.get("camera_BL_features", None).to(device),
-                "camera_BR_features": batch.get("camera_BR_features", None).to(device),
             }
 
             metrics, outputs = train_batch(train_state, model_input)
@@ -371,7 +380,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     f"ADE: {running_ade/running_count:.4f} | "
                     f"FDE: {running_fde/running_count:.4f} | "
                     f"ADE_real: {running_ade_real/running_count:.4f} | "
-                    f"FDE_real: {running_fde_real/running_count:.4f} | " 
+                    f"FDE_real: {running_fde_real/running_count:.4f} | "
                     f"Miss_rate: {running_mr/running_count:.2f}"
                 )
                 running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
@@ -392,11 +401,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         tbd_writer.add_scalar(f"ADE_real/train", tr_ade_real_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"FDE_real/train", tr_fde_real_sum / max(tr_n, 1), epoch+1)
         tbd_writer.add_scalar(f"Miss_rate/train", tr_mr_sum / max(tr_n, 1), epoch+1)
-
+        tbd_writer.add_scalar("Learning_rate", metrics['train/lr'], epoch+1)
 
         ############ Evaluation
-        if epoch % args.eval_every_n_epochs == 0:
-            logger.log(f"Running Validation...Epoch {epoch}")
+        if epoch % 1 == 0:
+            logger.log("Running Validation...")
             train_state.model.eval()
             val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = val_mr_sum = 0.0
             val_n = 0
@@ -408,7 +417,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     targets = batch["targets"].to(device)
                     targets_mask = batch.get("targets_mask", None)
                     targets_idx = batch.get("targets_idx", None).to(device)
-
                     if targets_mask is None:
                         targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
                     else:
@@ -421,12 +429,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         "targets": targets,
                         "targets_mask": targets_mask,
                         "targets_idx": targets_idx,
-                        "camera_F_features": batch.get("camera_F_features", None).to(device),
-                        "camera_FL_features": batch.get("camera_FL_features", None).to(device),
-                        "camera_FR_features": batch.get("camera_FR_features", None).to(device),
-                        "camera_B_features": batch.get("camera_B_features", None).to(device),
-                        "camera_BL_features": batch.get("camera_BL_features", None).to(device),
-                        "camera_BR_features": batch.get("camera_BR_features", None).to(device),
                     }
 
                     with torch.device("cuda"):
@@ -435,6 +437,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     # Forward
                     inference_steps = 0
                     while True:
+                        # print(inference_steps+1)
                         carry, loss, metrics, outputs, all_finish = train_state.model(
                             carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                         )
@@ -546,6 +549,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     epoch=epoch+1,
                     run_name=f'debug_{RUN_NAME}_val',
                     out_slice=config_dict["out_slice"],
+                    sub_name=args.tboard_name,
                 )
 
                 if ood_dataloader is not None:
@@ -559,8 +563,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         epoch=epoch+1,
                         run_name=f'debug_{RUN_NAME}_ood',
                         out_slice=config_dict["out_slice"],
+                        sub_name=args.tboard_name,
                     )
 
+        # if epoch == 2:
+        #     raise NotImplementedError
 
         logger.log("-" * 30)
 
@@ -569,94 +576,17 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     tbd_writer.flush()
     tbd_writer.close()
 
-def load_dataset(args):
-    print("Loading Dataset...")
-    if args.use_camera:
-        if args.lidar:
-            args.split_dir = f'cam-bev-{args.split_type}'
-        else:
-            args.split_dir = f'cam-{args.split_type}'
-            filename_prefix = "all_camera_features"
-    root_data = "/home/vilin/Rapid_Adapt_SM/src/data"
-    #root_data = "/home/hlpark/common-data/trm/data"
-    train_data_pth = f'{root_data}/{args.split_dir}/train.npz'
-    val_data_pth = f'{root_data}/{args.split_dir}/val.npz'
-
-    raw_data_dir = '/home/vilin/Rapid_Adapt_SM/raw_data/nuscenes'
-    
-    train_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_train.h5"
-    val_vid_feat_path = f"{root_data}/{args.split_dir}_resnet_feat18/{filename_prefix}_val.h5"
-
-        
-    print(f'Loading train dataset...')
-    tr_dataset = NuScenesDataset(train_data_pth, root_data, args.n_history,
-                                  args.n_horizon, args.max_obstacles, 
-                                  args.max_predict, args.dynamic_only,
-                                  use_camera=args.use_camera, 
-                                  use_lidar=args.lidar, use_bev=args.bev, 
-                                  use_map=args.map,
-                                  use_preprocessed=args.preprocessed_vid_fea, 
-                                  feature_path=train_vid_feat_path)
-    print('Loaded!')
-    stats = tr_dataset.compute_normalization_stats()
-    print(f"Computed normalization stats: {stats}")
-    tr_dataset.set_norm_stats(stats)
-    print('Updated train dataset with normalization stats!')
-
-    print(f'Loading val dataset...')
-    val_dataset = NuScenesDataset(val_data_pth, root_data, args.n_history, args.n_horizon, 
-                                  args.max_obstacles, args.max_predict, args.dynamic_only,
-                                  use_camera=args.use_camera, use_lidar=args.lidar, 
-                                  use_bev=args.bev, use_map=args.map,
-                                  use_preprocessed=args.preprocessed_vid_fea, 
-                                  feature_path=val_vid_feat_path, norm_stats=stats)
-    print(f'Loaded! {len(val_dataset)}')
-
-    test_dataset = None
-    tr_dataloader = DataLoader(tr_dataset, 
-                                batch_size=args.config_batch_size, 
-                                shuffle=True, 
-                                collate_fn=custom_collate,  
-                                num_workers=4,
-                                pin_memory=True,
-                                persistent_workers=True,
-                                prefetch_factor=2, drop_last=True) # need to trop last for asynchronous deep supervision
-    val_dataloader = DataLoader(val_dataset, 
-                                batch_size=args.config_batch_size, 
-                                shuffle=False, 
-                                collate_fn=custom_collate,
-                                num_workers=4,
-                                pin_memory=True,
-                                persistent_workers=True,
-                                prefetch_factor=2)
-    test_dataloader = None
-
-    pos_mean = stats["pos_mean"]
-    pos_std  = stats["pos_std"]
-    mean_xy = pos_mean[:2]                         # [2]
-    std_xy  = pos_std[:2]                          # [2]
-
-    print("Denormalize params: ", mean_xy, std_xy)
-
-    if 'standard' not in args.split_type:
-        ood_dataset = None
-        ood_dataloader = None
-    else:
-        ood_dataset = None
-        ood_dataloader = None
-
-    return tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy
-
 if __name__ == "__main__":
-    CAMERA_NAMES = ["F", "FL", "FR", "B", "BL", "BR"]
-  
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
+    parser.add_argument("--tboard_name", type=str, help="Name for tensorboard run")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_schedule", action="store_true", help="Use learning rate scheduler")
     parser.add_argument("--hidden_size", type=int, default=256)
     parser.add_argument("--halt_max_steps", type=int, default=1)
+    parser.add_argument("--H_cycles", type=int, default=3)
+    parser.add_argument("--L_cycles", type=int, default=6)
     parser.add_argument("--config_batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=4501)
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint if available")
@@ -670,32 +600,33 @@ if __name__ == "__main__":
                                              'object-bendy', 'object-ambulance', 'object-police'],)
     
     # modalities (always use pose data, but optionally add extra sensor data)
-    parser.add_argument("--camera", action="append", choices=CAMERA_NAMES, default=[], help=f"Cameras to use {CAMERA_NAMES}")
+    parser.add_argument("--camera_F", action="store_true", help="Use front camera data.")
+    parser.add_argument("--camera_FL", action="store_true", help="Use front left camera data.")
+    parser.add_argument("--camera_FR", action="store_true", help="Use front right camera data.")
+    parser.add_argument("--camera_B", action="store_true", help="Use back camera data.")
+    parser.add_argument("--camera_BL", action="store_true", help="Use back left camera data.")
+    parser.add_argument("--camera_BR", action="store_true", help="Use back right camera data.")
     parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
     parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
     parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
     parser.add_argument('--map', action='store_true', help='Add map context.')
 
     # task parameters (non-defaults are used for sanity checking and testing)
-    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds')
-    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds')
-    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles considered')
-    parser.add_argument("--eval_every_n_epochs", type=int, default=10, help='Save eval time by running validation every N epochs')
+    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds.')
+    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds.')
+    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles in context.')
     parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
     parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
+    parser.add_argument("--feature_set", type=str, choices=['hpnet'], help="Types of map features to use")
 
+    parser.add_argument( "--halt_config", type=str, required=True, help="Path to YAML config for ACTLossHeadNuScenes halting settings.")
+    parser.add_argument( "--halt_verbose", action='store_true', help="Enable verbose logging for ACT halting decisions.")
+    
     args = parser.parse_args()
 
     # update task parameters
     args.n_history = args.history_sec*SAMPLE_FREQ # current time inclusive
     args.n_horizon = args.horizon_sec*SAMPLE_FREQ
-
-    args.use_camera = {k: (k in args.camera) for k in CAMERA_NAMES}
-    # args.cam_names = [CAMERA_KEY_TO_NAME[k] for k in CAMERA_NAMES if args.use_camera[k]]
-    args.cam_names = [k for k in CAMERA_NAMES if args.use_camera[k]]
-    
-    print("Using cameras: ", args.use_camera)
-    print(args.cam_names)
 
     print(f"n_history: {args.n_history}, n_horizon: {args.n_horizon}")
 
@@ -709,7 +640,7 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    print("video feature use: ", args.preprocessed_vid_fea)
+    
     # load dataset
     tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
     
