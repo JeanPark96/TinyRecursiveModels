@@ -1,0 +1,14 @@
+name: halting_logic
+loss: traj_loss_smooth_l1_from_batch
+
+halt_threshold: 1.0 # in denormalized units
+halt_mode: mean
+halt_metric: l2
+n_correct_upper_bound: 8 # same as max_predict
+
+pred_key: "pred"
+targets_key: "targets"
+targets_mask_key: "targets_mask"
+
+denorm: True
+traj_reduction: sum
