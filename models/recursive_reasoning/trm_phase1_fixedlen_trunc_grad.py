@@ -10,7 +10,7 @@ from models.common import trunc_normal_init_
 import numpy as np
 from models.head import TRM_DenseHead
 from utils.buffer_compat import register_compat_buffer
-
+from utils.debug import summarize_hist
 @dataclass
 class VideoTRM_InnerCarry:
     z_H: torch.Tensor
@@ -26,6 +26,7 @@ class VideoTRM_Carry:
     
     current_data: Dict[str, torch.Tensor]
     prev_loss: torch.Tensor = None # added for Q_head training, default for back-compatability
+
 
 
 # ---------------------------
@@ -131,15 +132,174 @@ class VideoTRMBlock(nn.Module):
         self.mlp = SwiGLU(config.hidden_size, config.expansion)
         self.norm_eps = config.norm_eps
 
+    # def forward(self, hidden_states, context_tokens, cos_sin=None, attention_mask=None):
+    #     h = self.self_attn(cos_sin, hidden_states)
+    #     # --- DEBUG PROBE START ---
+    #     # Only print if we are in training and it's the first batch of the step
+    #     if self.training and torch.rand(1).item() < 0.01: # Sample 1% of times to avoid spam
+    #         with torch.no_grad():
+    #             input_norm = hidden_states.norm(dim=-1).mean().item()
+    #             update_norm = h.norm(dim=-1).mean().item()
+                
+    #             # Avoid division by zero
+    #             ratio = update_norm / (input_norm + 1e-6)
+                
+    #             print(f"\n[Layer Debug] Input Norm: {input_norm:.4f} | Update Norm: {update_norm:.4f} | Ratio: {ratio:.4f}")
+                
+    #             if ratio < 0.05:
+    #                  print("!!! WARNING: Vanishing Update Detected. Step Embedding might be too large. !!!")
+    #     hidden_states = rms_norm(hidden_states + h, self.norm_eps)
+
+    #     h = self.cross_attn(hidden_states, context_tokens, attention_mask=attention_mask)
+    #     hidden_states = rms_norm(hidden_states + h, self.norm_eps)
+
+    #     h = self.mlp(hidden_states)
+    #     hidden_states = rms_norm(hidden_states + h, self.norm_eps)
+    #     return hidden_states
+    # def forward(self, hidden_states, context_tokens, cos_sin=None, attention_mask=None):
+    #     # Configuration for Expected Health
+    #     # Healthy Ratio: 0.1 to 1.0 (The layer is actively changing the state)
+    #     # Warning Zone: < 0.05 (The update is very weak)
+    #     # Critical Failure: < 0.01 (The layer is doing nothing / Frozen)
+    #     MIN_HEALTHY_RATIO = 0.05
+        
+    #     # Decide to debug this pass (sample 1% or force if debugging)
+    #     do_debug = self.training and (torch.rand(1).item() < 0.01)
+
+    #     # ---------------------------------------------------------
+    #     # 1. Self-Attention Block
+    #     # ---------------------------------------------------------
+    #     h_self = self.self_attn(cos_sin, hidden_states)
+        
+    #     if do_debug:
+    #         with torch.no_grad():
+    #             input_norm = hidden_states.norm(dim=-1).mean().item()
+    #             update_norm = h_self.norm(dim=-1).mean().item()
+    #             ratio_self = update_norm / (input_norm + 1e-6)
+                
+    #             print(f"\n[Layer Health Check]")
+    #             print(f"  > Self-Attn: Input={input_norm:.4f} | Update={update_norm:.4f} | Ratio={ratio_self:.4f}")
+    #             if ratio_self < MIN_HEALTHY_RATIO:
+    #                  print(f"    !!! WARNING: Self-Attn is vanished (Ratio < {MIN_HEALTHY_RATIO}) !!!")
+    #                  print(f"    Possible Cause: Step Embedding too large or Learning Rate too low.")
+
+    #     hidden_states = rms_norm(hidden_states + h_self, self.norm_eps)
+
+
+    #     # ---------------------------------------------------------
+    #     # 2. Cross-Attention Block
+    #     # ---------------------------------------------------------
+    #     # Capture state before cross-attn for comparison
+    #     h_cross = self.cross_attn(hidden_states, context_tokens, attention_mask=attention_mask)
+
+    #     if do_debug:
+    #         with torch.no_grad():
+    #             input_norm = hidden_states.norm(dim=-1).mean().item()
+    #             update_norm = h_cross.norm(dim=-1).mean().item()
+    #             ratio_cross = update_norm / (input_norm + 1e-6)
+                
+    #             print(f"  > Cross-Attn: Input={input_norm:.4f} | Update={update_norm:.4f} | Ratio={ratio_cross:.4f}")
+    #             if ratio_cross < MIN_HEALTHY_RATIO:
+    #                  print(f"    !!! WARNING: Cross-Attn is vanished (Ratio < {MIN_HEALTHY_RATIO}) !!!")
+    #                  print(f"    Possible Cause: Context is being ignored or Query Projections are collapsed.")
+
+    #     hidden_states = rms_norm(hidden_states + h_cross, self.norm_eps)
+
+
+    #     # ---------------------------------------------------------
+    #     # 3. MLP Block
+    #     # ---------------------------------------------------------
+    #     h_mlp = self.mlp(hidden_states)
+
+    #     if do_debug:
+    #         with torch.no_grad():
+    #             input_norm = hidden_states.norm(dim=-1).mean().item()
+    #             update_norm = h_mlp.norm(dim=-1).mean().item()
+    #             ratio_mlp = update_norm / (input_norm + 1e-6)
+                
+    #             print(f"  > MLP Block: Input={input_norm:.4f} | Update={update_norm:.4f} | Ratio={ratio_mlp:.4f}")
+    #             if ratio_mlp < MIN_HEALTHY_RATIO:
+    #                  print(f"    !!! WARNING: MLP is vanished (Ratio < {MIN_HEALTHY_RATIO}) !!!")
+    #                  print(f"    Possible Cause: Dead ReLU/SwiGLU units or bad initialization.")
+    #             print("-" * 60)
+
+    #     hidden_states = rms_norm(hidden_states + h_mlp, self.norm_eps)
+        
+    #     return hidden_states
     def forward(self, hidden_states, context_tokens, cos_sin=None, attention_mask=None):
+        # 1% Sampling rate
+        do_debug = self.training and (torch.rand(1).item() < 0.01) and False
+
+        def check_impact(layer_name, old_state, update, new_state, src_mask=None):
+            with torch.no_grad():
+                # 1. Normalize vectors (Batch, Seq, Hidden)
+                old_dir = torch.nn.functional.normalize(old_state, dim=-1)
+                new_dir = torch.nn.functional.normalize(new_state, dim=-1)
+                
+                # 2. Compute Cosine Sim per TOKEN (Batch, Seq)
+                # We sum over the hidden dim (-1), leaving (Batch, Seq)
+                token_sims = (old_dir * new_dir).sum(dim=-1)
+                
+                # 3. Apply Mask if provided (to ignore padded tokens in stats)
+                # Note: For z_H (Latents), src_mask is usually None (all valid).
+                # If hidden_states HAD padding, we would mask here.
+                if src_mask is not None:
+                    # Assuming src_mask is (B, S) boolean
+                    valid_sims = token_sims[src_mask.bool()]
+                else:
+                    valid_sims = token_sims.view(-1) # Flatten all valid tokens
+
+                # 4. Calculate Stats
+                avg_sim = valid_sims.mean().item()
+                min_sim = valid_sims.min().item() # The token that moved the MOST
+                max_sim = valid_sims.max().item() # The token that moved the LEAST
+                
+                # 5. Check Magnitudes (Global Average)
+                old_norm = old_state.norm(dim=-1).mean().item()
+                new_norm = new_state.norm(dim=-1).mean().item()
+                
+                print(f"[{layer_name}]")
+                print(f"  > Cosine Sim (Per-Token): Avg={avg_sim:.4f} | Min={min_sim:.4f} (Most Active) | Max={max_sim:.4f} (Most Frozen)")
+                print(f"  > Magnitude: {old_norm:.3f} -> {new_norm:.3f}")
+                
+                # Warning if even the "most active" token is frozen
+                if min_sim > 0.999:
+                    print(f"    !!! WARNING: Frozen State. Even the most active token didn't move. !!!")
+
+        # -----------------------------------------------------------
+        # 1. Self-Attention
+        # -----------------------------------------------------------
         h = self.self_attn(cos_sin, hidden_states)
-        hidden_states = rms_norm(hidden_states + h, self.norm_eps)
+        hidden_states_new = rms_norm(hidden_states + h, self.norm_eps)
 
+        # Note: hidden_states (Latents) are usually fully valid, so src_mask=None
+        if do_debug: check_impact("Self-Attn", hidden_states, h, hidden_states_new)
+        
+        hidden_states = hidden_states_new
+
+        # -----------------------------------------------------------
+        # 2. Cross-Attention
+        # -----------------------------------------------------------
+        # The 'attention_mask' passed here is for CONTEXT (what we look at), 
+        # NOT for hidden_states (who is looking). 
+        # So we still pass src_mask=None for the impact check.
         h = self.cross_attn(hidden_states, context_tokens, attention_mask=attention_mask)
-        hidden_states = rms_norm(hidden_states + h, self.norm_eps)
+        hidden_states_new = rms_norm(hidden_states + h, self.norm_eps)
 
+        if do_debug: check_impact("Cross-Attn", hidden_states, h, hidden_states_new)
+        
+        hidden_states = hidden_states_new
+
+        # -----------------------------------------------------------
+        # 3. MLP
+        # -----------------------------------------------------------
         h = self.mlp(hidden_states)
-        hidden_states = rms_norm(hidden_states + h, self.norm_eps)
+        hidden_states_new = rms_norm(hidden_states + h, self.norm_eps)
+
+        if do_debug: check_impact("MLP Block", hidden_states, h, hidden_states_new)
+        
+        hidden_states = hidden_states_new
+        
         return hidden_states
 
 #----------------------------
@@ -154,8 +314,6 @@ class VideoTRM_ReasoningModule(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, context_tokens=input_injection, **kwargs)
         return hidden_states
-
-
 
 
 class TRMLocalizerSync(nn.Module):
@@ -203,6 +361,10 @@ class TRMLocalizerSync(nn.Module):
         with torch.no_grad():
             self.q_head.weight.zero_()
             self.q_head.bias.fill_(-5)  # type: ignore
+        
+        # NEW: Create the time-step embedding
+        # max_steps + 1 to be safe (e.g., if you run 0 to 8)
+        self.step_embedding = nn.Embedding(cfg.halt_max_steps + 1, cfg.hidden_size)
 
     def _prep_inputs(self, video_emb, text_emb, frame_mask=None, query_mask=None):
         """
@@ -269,7 +431,7 @@ class TRMLocalizerSync(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: VideoTRM_InnerCarry, batch: Dict[str, torch.Tensor]):
+    def forward(self, carry: VideoTRM_InnerCarry, batch: Dict[str, torch.Tensor], steps=None):
         # Unpack batch
         video_emb = batch["video_emb"]
         text_emb = batch["text_emb"]
@@ -279,7 +441,10 @@ class TRMLocalizerSync(nn.Module):
         v, q, context, T, mask = self._prep_inputs(
             video_emb, text_emb, frame_mask, query_mask
         )
+        debug = True
+        zH_hist, zL_hist = [], []
 
+        
         # --- MASK PREPARATION ---
         # mask is (B, T_total). 1=Keep, 0=Mask.
         # SDPA requires shape broadcasting to (B, NumHeads, Q_Len, KV_Len).
@@ -300,21 +465,38 @@ class TRMLocalizerSync(nn.Module):
         seq_info_for_h = seq_info.copy()
         seq_info_for_h['attention_mask'] = None # No mask needed for z_L
         z_H, z_L = carry.z_H, carry.z_L
+        # --- 1. INJECT STEP EMBEDDING HERE ---
+        if steps is not None:
+            if (steps != steps[0]).any():
+                print(f"Mixed Steps in Batch: {steps}")
+            # Clamp steps to fit in embedding table (0 to 8)
+            current_step_idx = steps.clamp(max=self.cfg.halt_max_steps).long()
+        
+            # Get the Time Signal
+            # Shape: (B, Hidden) -> (B, 1, Hidden) to broadcast across tokens
+            time_signal = self.step_embedding(current_step_idx).unsqueeze(1)
+            z_H = z_H + time_signal
+        def snap():
+            if debug:
+                zH_hist.append(z_H.detach().float().cpu())
+                zL_hist.append(z_L.detach().float().cpu())
 
+        snap()
         with torch.no_grad():
             for _h in range(self.cfg.H_cycles - 1):
                 for _ in range(self.cfg.L_cycles):
                     z_L_input = z_L + z_H
                     z_L = self.L_level(z_L_input, context, **seq_info)
+                    snap()
                 z_H = self.L_level(z_H, z_L, **seq_info_for_h)
-
+                snap()
         # last cycle with grad
         for _ in range(self.cfg.L_cycles):
             z_L_input = z_L + z_H
             z_L = self.L_level(z_L_input, context, **seq_info)
-        
+            snap()
         z_H = self.L_level(z_H, z_L, **seq_info_for_h)
-
+        snap()
         new_carry = VideoTRM_InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         # ---- Localization Prediction ----
         # We will pack outputs into a dictionary 'preds'
@@ -327,9 +509,14 @@ class TRMLocalizerSync(nn.Module):
         else:
             time_logits = self.loc_head(z_H, T)              # (B,T)
 
-            raise ValueError(f"Unknown loc_head: {cfg.loc_head}")
+            raise ValueError(f"Unknown loc_head: {self.cfg.loc_head}")
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        return new_carry, time_logits, reg_offsets, (q_logits[..., 0], q_logits[...,1])
+        debug_stats = {}
+        if debug and len(zH_hist) > 1:
+            debug_stats["zH"] = summarize_hist(zH_hist)
+            debug_stats["zL"] = summarize_hist(zL_hist)
+
+        return new_carry, time_logits, reg_offsets, (q_logits[..., 0], q_logits[...,1]), debug_stats
 
 class Video_TRM_ACT(nn.Module):
     """ACT wrapper."""
@@ -361,19 +548,21 @@ class Video_TRM_ACT(nn.Module):
         new_steps = torch.where(carry.halted, 0, carry.steps)
         new_prev_loss = torch.where(
             carry.halted,
-            torch.full_like(carry.prev_loss, float('inf')),
+            # torch.full_like(carry.prev_loss, float('inf')),
+            torch.zeros_like(carry.prev_loss),
             carry.prev_loss,
         )
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
         # Forward inner model
-        new_inner_carry, logits, extra_logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        new_inner_carry, logits, extra_logits, (q_halt_logits, q_continue_logits), debug_stats = self.inner(new_inner_carry, new_current_data, new_steps)
 
         outputs = {
             "logits": logits,
             "extra_logits": extra_logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            "debug_stats": debug_stats
         }
 
         with torch.no_grad():

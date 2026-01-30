@@ -37,7 +37,7 @@ from omegaconf import DictConfig
 from dataset.build_charades_sta_snag import *
 # from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
 from models.losses import VideoTRMACTDenseLossHead
-from models.recursive_reasoning.trm_phase1_fixedlen_trunc_grad import (
+from models.recursive_reasoning.trm_phase1_i3d_fusion import (
     Video_TRM_ACT,
     TRMLocalizerConfig
 )
@@ -167,18 +167,44 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
 
     # --- Check for resume ---
     last_ckpt_path = os.path.join(run_ckpt_dir, "last.pth")
+    # ckpt = None
+    # start_epoch = 0
+    # global_step = 0
+    # best_val_loss = float("inf")
+
+    # if args.resume and os.path.exists(last_ckpt_path):
+    #     print(f"Resuming from checkpoint: {last_ckpt_path}")
+    #     ckpt = torch.load(last_ckpt_path, map_location="cpu")
+    #     config_dict = ckpt["config"]
+    #     start_epoch = ckpt.get("epoch", 0) + 1  # epoch stored as 0-based
+    #     global_step = ckpt.get("global_step", 0)
+    #     best_val_loss = ckpt.get("best_val_loss", float("inf"))
     ckpt = None
     start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
 
-    if args.resume and os.path.exists(last_ckpt_path):
-        print(f"Resuming from checkpoint: {last_ckpt_path}")
-        ckpt = torch.load(last_ckpt_path, map_location="cpu")
-        config_dict = ckpt["config"]
-        start_epoch = ckpt.get("epoch", 0) + 1  # epoch stored as 0-based
-        global_step = ckpt.get("global_step", 0)
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    if args.resume:
+        # 1. Try to find the most recent epoch-based checkpoint
+        checkpoint_files = [f for f in os.listdir(run_ckpt_dir) if f.startswith("epoch_") and f.endswith(".pth")]
+        
+        target_ckpt_path = None
+        if os.path.exists(last_ckpt_path):
+            target_ckpt_path = last_ckpt_path
+        elif checkpoint_files:
+            # Sort by epoch number: "epoch_10.pth" -> 10
+            checkpoint_files.sort(key=lambda x: int(x.split('_')[1].split('.')[0]))
+            target_ckpt_path = os.path.join(run_ckpt_dir, checkpoint_files[-1])
+
+        if target_ckpt_path:
+            print(f"Resuming from checkpoint: {target_ckpt_path}")
+            ckpt = torch.load(target_ckpt_path, map_location="cpu", weights_only=False)
+            config_dict = ckpt["config"]
+            start_epoch = ckpt.get("epoch", 0) + 1 
+            global_step = ckpt.get("global_step", 0)
+            best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        else:
+            print(f"No checkpoints found in {run_ckpt_dir}; starting from scratch.")
     else:
         # --- Fresh config (for TRM_ACT_NuScenes) ---
         config_dict = {
@@ -187,7 +213,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
             "hidden_size": args.hidden_size,
             "H_cycles": args.H_cycles,
             "L_cycles": args.L_cycles,
-            "L_layers": 2,
+            "L_layers": 1,
             #"pos_encodings": "none",  # can switch to "rope" later
             "num_y_tokens" : 32, 
             "num_z_tokens" : 32,
@@ -199,7 +225,8 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
             "loc_head" : args.loss_option,
             "video_in_dim": 2048,
             "query_in_dim": 300,
-            "max_text_len": 16
+            "max_text_len": 16,
+            "include_query_in_context": False
         }
 
         with open(os.path.join("./config", f"{RUN_NAME}.json"), "w") as f:
@@ -209,19 +236,43 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
             print(f"No checkpoint found at {last_ckpt_path}; starting from scratch.")
 
     # Initialize Logger
-    logger = Logger(LOG_DIR, RUN_NAME, config_dict)
-    logger.log("Loading Dataset...")
-    logger.log(f"Dataset Loaded. Train samples: {len(tr_dataset)}, Val samples: {len(val_dataset)}")
-
+    logger = Logger(LOG_DIR, RUN_NAME, config_dict, resume=args.resume)
     if ckpt is not None:
+        logger.log(f"\n--- RESUMING SESSION AT EPOCH {start_epoch} ---")
         logger.log(
             f"Resuming from checkpoint at epoch {start_epoch}, "
             f"global_step {global_step}, best_val_loss={best_val_loss:.4f}"
         )
     
+    else:
+        logger.log("--- STARTING NEW SESSION ---")
+    run_base_path = os.path.join(TBOARD_DIR, RUN_NAME)
+    if args.resume and os.path.exists(run_base_path):
+        # List all subdirectories (timestamps)
+        subdirs = [os.path.join(run_base_path, d) for d in os.listdir(run_base_path) 
+                  if os.path.isdir(os.path.join(run_base_path, d))]
+        
+        if subdirs:
+            # Sort by creation time to find the most recent session
+            latest_tboard_dir = max(subdirs, key=os.path.getmtime)
+            tboard_run_path = latest_tboard_dir
+            print(f"Resuming TensorBoard session in: {tboard_run_path}")
+        else:
+            # Fallback if the folder exists but is empty
+            datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+            tboard_run_path = os.path.join(run_base_path, datetimestr)
+    else:
+        # Brand new run: create a new timestamped folder
+        datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+        tboard_run_path = os.path.join(run_base_path, datetimestr)
+    
     # Set up tensorboard
     datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
-    tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{datetimestr}'))
+    tbd_writer = SummaryWriter(tboard_run_path)
+
+    logger.log("Loading Dataset...")
+    logger.log(f"Dataset Loaded. Train samples: {len(tr_dataset)}, Val samples: {len(val_dataset)}")
+
 
     # --- Model & optimizer ---
     logger.log("Initializing Model...")
@@ -232,18 +283,21 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
     if ckpt is not None:
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
-
+    steps_per_epoch = len(tr_dataloader)
+    total_training_steps = steps_per_epoch * args.epochs
+    current_global_step = start_epoch * steps_per_epoch
+    warmup_steps = 500
     # Train state
     train_state = TrainState(
-        step=0,
-        total_steps=0, # unused for now
+        step=current_global_step,
+        total_steps=total_training_steps, # unused for now
 
         model=VideoTRMACTDenseLossHead(model=model),
         optimizers=[optimizer],
         optimizer_lrs=[args.lr],
         optimizer_lr_schedule=args.lr_schedule,
-        optimizer_lr_min_ratio=1.0,
-        optimizer_lr_warmup_steps=2000,
+        optimizer_lr_min_ratio=0.01,
+        optimizer_lr_warmup_steps=warmup_steps,
         carry=None
     )
 
@@ -286,7 +340,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
 
             metrics, outputs = train_batch(train_state, model_input)
             #batch_target_outputs = train_state.carry.current_data[""]
-
+            if train_state.step % 200 == 0 and "debug_stats" in outputs:
+                zH = outputs["debug_stats"]["zH"]
+                zL = outputs["debug_stats"]["zL"]
+                logger.log(f"####zH####\n {zH}")
+                logger.log(f"\n*****zL******\n {zL}")
             # calc extra metrics
             pred = outputs["logits"]
             if args.loss_option == "dense_head":
