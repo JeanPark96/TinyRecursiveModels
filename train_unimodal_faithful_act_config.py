@@ -1,0 +1,648 @@
+from typing import Optional, Any, Sequence, List
+from dataclasses import dataclass
+import os
+import math
+import yaml
+import shutil
+import copy
+
+import torch
+import torch.distributed as dist
+from torch import nn
+from torch.utils.data import DataLoader
+
+import tqdm
+# import wandb
+# import coolname
+# import hydra
+# import pydantic
+from omegaconf import DictConfig
+# from adam_atan2 import AdamATan2
+
+from utils.functions import load_model_class, get_model_source_path
+from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
+from models.ema import EMAHelper
+
+# new imports
+from nuscenes_dataset import load_dataset
+import argparse
+from utils.log import Logger
+from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
+from utils.metrics import compute_metrics
+from models.act_losses import ACTLossHeadNuScenes
+import random
+import numpy as np
+import json
+import datetime
+import sys
+import importlib
+import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
+from torch.utils.tensorboard import SummaryWriter
+import torch.optim as optim
+from utils.halt_helper import load_yaml, build_act_head_kwargs_from_yaml
+
+importlib.reload(trm_unimodal)
+# --- IMPORTS ---
+# Ensure these imports match your file structure
+# from my_dataset import NuScenesMiniDataset, custom_collate 
+
+# from models.recursive_reasoning.trm_unimodal_v2 import (
+#     TRM_ACT_NuScenes,
+#     TRM_ACT_NuScenes_Config
+# )
+importlib.reload(trm_unimodal)
+from models.recursive_reasoning.trm_unimodal_v5 import (
+    TRM_ACT_NuScenes,
+    TRM_ACT_NuScenes_Config
+)
+
+SAMPLE_FREQ = 2
+
+@dataclass
+class TrainState:
+    model: nn.Module
+    optimizers: Sequence[torch.optim.Optimizer]
+    optimizer_lrs: Sequence[float]
+    optimizer_lr_schedule: bool
+    optimizer_lr_min_ratio: float
+    optimizer_lr_warmup_steps: int
+    carry: Any
+
+    step: int
+    total_steps: int
+
+def mix_weights_direct(device, alpha, net, nets):
+    sd = []
+    for i in range(len(nets)):
+        sd += [nets[i].state_dict()]
+    sd_alpha = {}
+    for k in sd[0].keys():
+        comb_net = alpha[0]*sd[0][k].to(device)
+        for i in range(1,len(nets)):
+            comb_net += alpha[i]*sd[i][k].to(device)
+        sd_alpha[k] =  comb_net
+    net.load_state_dict(sd_alpha)
+    return net
+
+def cosine_schedule_with_warmup_lr_lambda(
+    current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
+):
+    if current_step < num_warmup_steps:
+        return base_lr * float(current_step) / float(max(1, num_warmup_steps))
+
+    progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+    return base_lr * (min_ratio + max(0.0, (1 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * float(num_cycles) * 2.0 * progress))))
+
+def compute_lr(base_lr: float, train_state: TrainState):
+    return cosine_schedule_with_warmup_lr_lambda(
+        current_step=train_state.step,
+        base_lr=base_lr,
+        num_warmup_steps=round(train_state.optimizer_lr_warmup_steps),
+        num_training_steps=train_state.total_steps,
+        min_ratio=train_state.optimizer_lr_min_ratio
+    )
+
+def train_batch(train_state: TrainState, batch: Any):
+    train_state.step += 1
+    # if train_state.step > train_state.total_steps:  # At most train_total_steps
+    #     return
+
+    # To device
+    batch = {k: v.cuda() for k, v in batch.items()}
+    batch_size = batch[list(batch.keys())[0]].shape[0]
+
+    # Init carry if it is None
+    if train_state.carry is None:
+        with torch.device("cuda"):
+            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+
+    # Forward
+    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry,
+                                                                     batch=batch,
+                                                                     return_keys=["pred", "pred_recursions"])
+
+    ((1 / batch_size) * loss).backward()
+            
+    # Apply optimizer
+    lr_this_step = None    
+    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+        if train_state.optimizer_lr_schedule:
+            lr_this_step = compute_lr(base_lr, train_state)
+        else:
+            lr_this_step = base_lr
+
+        for param_group in optim.param_groups:
+            param_group['lr'] = lr_this_step
+            
+        optim.step()
+        optim.zero_grad()
+
+    # Reduce metrics
+    if len(metrics):
+        assert not any(v.requires_grad for v in metrics.values())
+
+        metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
+        # Reduce and reconstruct
+        metric_values = torch.stack([metrics[k] for k in metric_keys])
+
+        metric_values = metric_values.cpu().numpy()
+        reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
+        
+        # Postprocess
+        count = max(reduced_metrics["count"], 1)  # Avoid NaNs
+        reduced_metrics = {f"train/{k}": v / (batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
+
+        reduced_metrics["train/lr"] = lr_this_step
+        return reduced_metrics, outputs
+
+def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy):
+    RUN_NAME = args.run_name
+    LOG_DIR = os.path.join("logs", RUN_NAME)
+    CKPT_DIR = "checkpoints"
+    TBOARD_DIR = "tboard"
+    run_ckpt_dir = os.path.join(CKPT_DIR, RUN_NAME, args.tboard_name)
+    os.makedirs(run_ckpt_dir, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(TBOARD_DIR, exist_ok=True)
+
+    # Device / GPU selection
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{args.gpu_id}")
+        torch.cuda.set_device(args.gpu_id)
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
+    mean_xy = mean_xy.to(device)
+    std_xy = std_xy.to(device)
+
+    # load halt config file
+    halt_cfg_raw = load_yaml(args.halt_config)
+    act_head_kwargs = build_act_head_kwargs_from_yaml(halt_cfg_raw)
+
+    if act_head_kwargs["denorm"]:
+        act_head_kwargs["std_xy"] = std_xy
+        act_head_kwargs["mean_xy"] = mean_xy
+    if args.halt_verbose:
+        act_head_kwargs["verbose"] = True
+
+    # --- Infer key dims from a real batch (prevents config mismatch) ---
+    sample = next(iter(tr_dataloader))
+    # n_history = sample["obs_pose"].shape[1]
+    # max_obstacles = sample["obs_pose"].shape[2]
+    # n_horizon = sample["targets"].shape[1]
+
+    # --- Check for resume ---
+    last_ckpt_path = os.path.join(run_ckpt_dir, "last.pth")
+    ckpt = None
+    start_epoch = 0
+    global_step = 0
+    best_val_loss = float("inf")
+
+    if args.resume and os.path.exists(last_ckpt_path):
+        print(f"Resuming from checkpoint: {last_ckpt_path}")
+        ckpt = torch.load(last_ckpt_path, map_location="cpu")
+        config_dict = ckpt["config"]
+        start_epoch = ckpt.get("epoch", 0) + 1  # epoch stored as 0-based
+        global_step = ckpt.get("global_step", 0)
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+    else:
+        # --- Fresh config (for TRM_ACT_NuScenes) ---
+        print("Horizon", args.n_horizon)
+        config_dict = {
+            "batch_size": args.config_batch_size,  # logical batch size; dataloader can differ
+            "n_history": args.n_history,
+            "max_obstacles": args.max_obstacles,
+            "max_predict": args.max_predict,
+            "n_horizon": args.n_horizon,
+
+            "in_dim": 7,
+            "out_dim": 2,          # predict x,y
+            "out_slice": 2,        # supervise x,y
+            "predict_delta": True,
+
+            "global_len": 1,       # keep global latent token
+            "seq_len": args.max_obstacles * args.n_history,
+
+            "hidden_size": args.hidden_size,
+            "time_dim": 16,
+            "expansion": 2.0,
+            "num_heads": 4,
+            "H_cycles": args.H_cycles,
+            "L_cycles": args.L_cycles,
+            "H_layers": 0,
+            "L_layers": 2,
+            "pos_encodings": "none",  # can switch to "rope" later
+
+            "halt_max_steps": args.halt_max_steps,
+            "halt_exploration_prob": 0.0,
+            "no_ACT_continue": True,
+
+            "forward_dtype": "float32",
+            "mlp_t": False,
+            "halt_config_name": args.halt_config
+        }
+
+        with open(os.path.join("./config", f"{RUN_NAME}.json"), "w") as f:
+            json.dump(config_dict, f, indent=4)
+
+        if args.resume:
+            print(f"No checkpoint found at {last_ckpt_path}; starting from scratch.")
+
+    # Initialize Logger
+    logger = Logger(LOG_DIR, args.tboard_name, config_dict)
+    logger.log("Loading Dataset...")
+    logger.log(f"Dataset Loaded. Train samples: {len(tr_dataset)}, Val samples: {len(val_dataset)}")
+
+    if ckpt is not None:
+        logger.log(
+            f"Resuming from checkpoint at epoch {start_epoch}, "
+            f"global_step {global_step}, best_val_loss={best_val_loss:.4f}"
+        )
+    
+    # Set up tensorboard
+    if args.tboard_name is None:
+        datetimestr = datetime.datetime.today().strftime('%Y-%m-%d-%H-%M-%S')
+        tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{datetimestr}'))
+    else:
+        tbd_writer = SummaryWriter(os.path.join(TBOARD_DIR, f'{RUN_NAME}/{args.tboard_name}'))
+
+    # --- Model & optimizer ---
+    logger.log("Initializing Model...")
+    model = TRM_ACT_NuScenes(config_dict).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
+
+    if ckpt is not None:
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+    # --- Choose a debug batch for qualitative comparison across epochs ---
+    debug_batch, debug_idx, rdm_agents, rdm_samples = select_debug_batch(val_dataloader, seed=args.seed)    
+    logger.log(f"Selected validation batch index {debug_idx} as debug batch for plotting.")
+
+    # --- Choose a debug batch for ood for qualitative comparison across epochs ---
+    if ood_dataloader is not None:
+        ood_debug_batch, ood_debug_idx, ood_rdm_agents, ood_rdm_samples = select_debug_batch(ood_dataloader, seed=args.seed)
+        logger.log(f"Selected ood batch index {debug_idx} as debug batch for plotting.")
+
+
+    # Train state
+    train_state = TrainState(
+        step=0,
+        total_steps=0, # unused for now
+        model=ACTLossHeadNuScenes(model=model, 
+                                    **act_head_kwargs),
+        optimizers=[optimizer],
+        optimizer_lrs=[args.lr],
+        optimizer_lr_schedule=args.lr_schedule,
+        optimizer_lr_min_ratio=1.0,
+        optimizer_lr_warmup_steps=2000,
+        carry=None
+    )
+    
+    # --- Plot BEFORE training/resume (using current model state) ---
+    plot_debug_batch(
+        train_state,
+        val_dataset,
+        debug_batch,
+        rdm_agents,
+        rdm_samples,
+        device,
+        epoch=start_epoch,
+        run_name=f'debug_{RUN_NAME}_val',
+        out_slice=config_dict["out_slice"],
+        sub_name=args.tboard_name,
+    )
+
+    # Training Loop
+    for epoch in range(start_epoch, args.epochs):
+        logger.log(f"\n=== Starting Epoch {epoch+1}/{args.epochs} ===")
+
+        ############ Train Iter
+        train_state.model.train()
+
+        # step-wise stats
+        running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
+        running_count = 0
+
+        # epoch-wise stats
+        tr_ade_sum = tr_fde_sum = tr_ade_real_sum = tr_fde_real_sum = tr_loss_sum = tr_mr_sum= 0.0
+        tr_n = 0
+
+        for batch_idx, batch in enumerate(tr_dataloader):
+            obs_pose = batch["obs_pose"].to(device)              # [B, Hist, A, 7]
+            obs_mask = batch["obs_mask"].to(device)              # [B, Hist, A]
+            targets = batch["targets"].to(device)                # [B, Fut, A, 7]
+            targets_mask = batch.get("targets_mask", None)       # [B, Fut, A]
+            targets_idx = batch.get("targets_idx", None).to(device)        # [B, Aout]
+            if targets_mask is None:
+                targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
+            else:
+                targets_mask = targets_mask.to(device)
+            
+            model_input = {
+                "obs_pose": obs_pose,
+                "obs_mask": obs_mask,
+                "targets": targets,
+                "targets_mask": targets_mask,
+                "targets_idx": targets_idx,
+            }
+
+            metrics, outputs = train_batch(train_state, model_input)
+
+            # calc extra metrics
+            batch_targets = train_state.carry.current_data['targets'] # accommodate asynchronous deep supervision
+            batch_targets_mask = train_state.carry.current_data['targets_mask'] # accommodate asynchronous deep supervision
+            pred = outputs["pred"]
+            ade, fde, _ = compute_metrics(
+                pred, batch_targets, batch_targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
+            )
+
+            pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
+            targets_xy_denorm = (batch_targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
+
+            ade_real, fde_real, mr = compute_metrics(
+                pred_xy_denorm, targets_xy_denorm, batch_targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
+            )
+
+            # log metrics
+            running_ade += ade
+            running_fde += fde
+            running_ade_real += ade_real
+            running_fde_real += fde_real
+            running_mr += mr
+            running_loss += metrics['train/loss']
+            running_count += 1
+            if train_state.step % 50 == 0:
+                logger.log(
+                    f"Epoch [{epoch+1}] Step [{train_state.step}] "
+                    f"Loss: {running_loss/running_count:.4f} | "
+                    f"ADE: {running_ade/running_count:.4f} | "
+                    f"FDE: {running_fde/running_count:.4f} | "
+                    f"ADE_real: {running_ade_real/running_count:.4f} | "
+                    f"FDE_real: {running_fde_real/running_count:.4f} | "
+                    f"Miss_rate: {running_mr/running_count:.2f}"
+                )
+                running_loss = running_ade = running_fde = running_ade_real = running_fde_real = running_mr = 0.0
+                running_count = 0
+
+            tr_ade_sum += ade
+            tr_fde_sum += fde
+            tr_ade_real_sum += ade_real
+            tr_fde_real_sum += fde_real
+            tr_mr_sum += mr
+            tr_loss_sum += metrics['train/loss']
+            tr_n += 1
+
+        # tensorboard logging
+        tbd_writer.add_scalar(f"Loss/train", tr_loss_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"ADE/train", tr_ade_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"FDE/train", tr_fde_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"ADE_real/train", tr_ade_real_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"FDE_real/train", tr_fde_real_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar(f"Miss_rate/train", tr_mr_sum / max(tr_n, 1), epoch+1)
+        tbd_writer.add_scalar("Learning_rate", metrics['train/lr'], epoch+1)
+
+        ############ Evaluation
+        if epoch % 1 == 0:
+            logger.log("Running Validation...")
+            train_state.model.eval()
+            val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = val_mr_sum = 0.0
+            val_n = 0
+
+            with torch.no_grad():
+                for batch in val_dataloader:
+                    obs_pose = batch["obs_pose"].to(device)
+                    obs_mask = batch["obs_mask"].to(device)
+                    targets = batch["targets"].to(device)
+                    targets_mask = batch.get("targets_mask", None)
+                    targets_idx = batch.get("targets_idx", None).to(device)
+                    if targets_mask is None:
+                        targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
+                    else:
+                        targets_mask = targets_mask.to(device)
+                    batch_size = obs_pose.shape[0]
+
+                    model_input = {
+                        "obs_pose": obs_pose,
+                        "obs_mask": obs_mask,
+                        "targets": targets,
+                        "targets_mask": targets_mask,
+                        "targets_idx": targets_idx,
+                    }
+
+                    with torch.device("cuda"):
+                        carry = train_state.model.initial_carry(model_input)  # type: ignore
+
+                    # Forward
+                    inference_steps = 0
+                    while True:
+                        # print(inference_steps+1)
+                        carry, loss, metrics, outputs, all_finish = train_state.model(
+                            carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
+                        )
+                        inference_steps += 1
+
+                        if all_finish:
+                            break
+
+                    # Reduce metrics
+                    if len(metrics):
+                        assert not any(v.requires_grad for v in metrics.values())
+
+                        metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
+                        # Reduce and reconstruct
+                        metric_values = torch.stack([metrics[k] for k in metric_keys])
+
+                        metric_values = metric_values.cpu().numpy()
+                        reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
+                        
+                        # Postprocess
+                        count = max(reduced_metrics["count"], 1)  # Avoid NaNs
+                        reduced_metrics = {f"val/{k}": v / (batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
+
+                        reduced_metrics["val/lr"] = args.lr # original code has lr on a schedule
+                            
+                    # calc extra metrics
+                    pred = outputs["pred"]
+                    ade, fde, _ = compute_metrics(
+                        pred, targets, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
+                    )
+
+                    pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
+                    targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
+
+                    ade_real, fde_real, mr = compute_metrics(
+                        pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
+                    )
+
+                    # log metrics
+                    val_ade_sum += ade
+                    val_fde_sum += fde
+                    val_ade_real_sum += ade_real
+                    val_fde_real_sum += fde_real
+                    val_mr_sum += mr
+                    val_loss_sum += reduced_metrics['val/loss']
+                    val_n += 1
+
+            val_ade = val_ade_sum / max(val_n, 1)
+            val_fde = val_fde_sum / max(val_n, 1)
+            val_ade_real = val_ade_real_sum / max(val_n, 1)
+            val_fde_real = val_fde_real_sum / max(val_n, 1)
+            val_mr = val_mr_sum / max(val_n, 1)
+            val_loss = val_loss_sum / max(val_n, 1)
+
+            logger.log(
+                f"Validation Results - Epoch {epoch+1}: "
+                f"Loss: {val_loss:.4f} | "
+                f"ADE: {val_ade:.4f} | "
+                f"FDE: {val_fde:.4f} | "
+                f"Real ADE: {val_ade_real:.4f} | "
+                f"Real FDE: {val_fde_real:.4f} | "
+                f"Miss rate: {val_mr:.2f}"
+            )
+
+            # tensorboard logging
+            tbd_writer.add_scalar(f"Loss/val",val_loss,epoch+1)
+            tbd_writer.add_scalar(f"ADE/val",val_ade,epoch+1)
+            tbd_writer.add_scalar(f"FDE/val",val_fde,epoch+1)
+            tbd_writer.add_scalar(f"ADE_real/val",val_ade_real,epoch+1)
+            tbd_writer.add_scalar(f"FDE_real/val",val_fde_real,epoch+1)
+            tbd_writer.add_scalar(f"Miss_rate/val",val_mr,epoch+1)
+                
+            ############ Checkpointing
+            epoch_ckpt_path = os.path.join(run_ckpt_dir, f"epoch_{epoch+1}.pth")
+            ckpt_payload = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "global_step": global_step, # note: this is meaningless in this ver (can't track global steps bc deep supervision is asynchronous)
+                "epoch": epoch,  # 0-based
+                "config": config_dict,
+                "val_loss": val_loss,
+                "val_ade": val_ade,
+                "val_fde": val_fde,
+                "val_mr": val_mr,
+                "best_val_loss": best_val_loss,
+            }
+            torch.save(ckpt_payload, epoch_ckpt_path)
+            logger.log(f"Saved epoch checkpoint to {epoch_ckpt_path}")
+
+            # --- Track & save best model ---
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_ckpt_path = os.path.join(run_ckpt_dir, "best.pth")
+                best_payload = ckpt_payload.copy()
+                best_payload["best_val_loss"] = best_val_loss
+                torch.save(best_payload, best_ckpt_path)
+                logger.log(
+                    f"New best model (val_loss={best_val_loss:.4f}); saved to {best_ckpt_path}"
+                )
+
+                # --- Plot debug batch AFTER this epoch if val loss improving ---
+                plot_debug_batch(
+                    train_state,
+                    val_dataset,
+                    debug_batch,
+                    rdm_agents,
+                    rdm_samples,
+                    device,
+                    epoch=epoch+1,
+                    run_name=f'debug_{RUN_NAME}_val',
+                    out_slice=config_dict["out_slice"],
+                    sub_name=args.tboard_name,
+                )
+
+                if ood_dataloader is not None:
+                    plot_debug_batch(
+                        train_state,
+                        ood_dataset,
+                        ood_debug_batch,
+                        ood_rdm_agents,
+                        ood_rdm_samples,
+                        device,
+                        epoch=epoch+1,
+                        run_name=f'debug_{RUN_NAME}_ood',
+                        out_slice=config_dict["out_slice"],
+                        sub_name=args.tboard_name,
+                    )
+
+        # if epoch == 2:
+        #     raise NotImplementedError
+
+        logger.log("-" * 30)
+
+    # finalize
+    logger.log("Training Complete.")
+    tbd_writer.flush()
+    tbd_writer.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
+    parser.add_argument("--tboard_name", type=str, help="Name for tensorboard run")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_schedule", action="store_true", help="Use learning rate scheduler")
+    parser.add_argument("--hidden_size", type=int, default=256)
+    parser.add_argument("--halt_max_steps", type=int, default=1)
+    parser.add_argument("--H_cycles", type=int, default=3)
+    parser.add_argument("--L_cycles", type=int, default=6)
+    parser.add_argument("--config_batch_size", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=4501)
+    parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint if available")
+    parser.add_argument("--gpu_id", type=int, default=0, help="GPU id to use (0-based)")
+    parser.add_argument('--split_type', type=str, default='standard', help='Dataset split methods. OOD splits of type oodType are named with convention oodType-oodSubType, where oodSubType does not appear in the ID train/val/test distribution.',
+                                    choices=['standard',
+                                             'city-boston', 'city-singapore',
+                                             'map-boston-seaport', 'map-singapore-onenorth', 'map-singapore-queensto', 'map-singapore-hollandv',
+                                             'object-animal', 'object-child', 'object-construction_worker', 'object-personal_mobility', 'object-police_officer', 'object-stroller', 'object-wheelchair',
+                                             'object-debris', 'object-bicycle_rack',
+                                             'object-bendy', 'object-ambulance', 'object-police'],)
+    
+    # modalities (always use pose data, but optionally add extra sensor data)
+    parser.add_argument("--camera_F", action="store_true", help="Use front camera data.")
+    parser.add_argument("--camera_FL", action="store_true", help="Use front left camera data.")
+    parser.add_argument("--camera_FR", action="store_true", help="Use front right camera data.")
+    parser.add_argument("--camera_B", action="store_true", help="Use back camera data.")
+    parser.add_argument("--camera_BL", action="store_true", help="Use back left camera data.")
+    parser.add_argument("--camera_BR", action="store_true", help="Use back right camera data.")
+    parser.add_argument("--preprocessed_vid_fea", action="store_true", help="Use preprocessed video features.")
+    parser.add_argument("--lidar", action="store_true", help="Use raw LIDAR data.")
+    parser.add_argument("--bev", action="store_true", help="Use processed BEV data.")
+    parser.add_argument('--map', action='store_true', help='Add map context.')
+
+    # task parameters (non-defaults are used for sanity checking and testing)
+    parser.add_argument("--history_sec", type=int, default=2, help='Length of history in seconds.')
+    parser.add_argument("--horizon_sec", type=int, default=6, help='Length of future in seconds.')
+    parser.add_argument("--max_obstacles", type=int, default=30, help='Max number of obstacles in context.')
+    parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
+    parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
+    parser.add_argument("--feature_set", type=str, choices=['hpnet'], help="Types of map features to use")
+
+    parser.add_argument( "--halt_config", type=str, required=True, help="Path to YAML config for ACTLossHeadNuScenes halting settings.")
+    parser.add_argument( "--halt_verbose", action='store_true', help="Enable verbose logging for ACT halting decisions.")
+    
+    args = parser.parse_args()
+
+    # update task parameters
+    args.n_history = args.history_sec*SAMPLE_FREQ # current time inclusive
+    args.n_horizon = args.horizon_sec*SAMPLE_FREQ
+
+    print(f"n_history: {args.n_history}, n_horizon: {args.n_horizon}")
+
+    # Optional CUDA debug envs (you can comment these out if you don't want sync execution)
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
+    # Seeds for reproducibility (also used for picking debug batch)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    # load dataset
+    tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy = load_dataset(args)
+    
+    # train
+    train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloader, val_dataloader, test_dataloader, ood_dataloader, stats, mean_xy, std_xy)
