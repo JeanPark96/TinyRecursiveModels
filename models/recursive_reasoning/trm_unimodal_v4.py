@@ -17,9 +17,10 @@ V4 is ased off of V2.
 V3, which primarily added add/norm in the decoder block, is skipped due to poor performance.
 Major changes in this version:
     Allow number of output agents to be less than number of input agents
-    Incorporate target idx in decoding process
+    Incorporate target idx in decoding process [REMOVED - DIDN'T WORK]
     Remove agent ID encoding and use SPE-based time encoding
     Incorporate history mask as attention mask
+    Enable cross-agent self-attention only in H loops
 '''
 
 # =========================
@@ -285,6 +286,8 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        # self.H_init = nn.Buffer(torch.zeros(self.config.hidden_size, dtype=self.forward_dtype))
+        # self.L_init = nn.Buffer(torch.zeros(self.config.hidden_size, dtype=self.forward_dtype))
 
         with torch.no_grad():
             self.q_head.weight.zero_()
@@ -406,7 +409,13 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         self,
         carry: TRM_ACT_NuScenes_InnerCarry,
         batch: Dict[str, torch.Tensor],
+        steps=None,
     ) -> Tuple[TRM_ACT_NuScenes_InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+
+        # check if ACT halting is doing anything
+        # if steps is not None and self.training:
+        #     if (steps != steps[0]).any():
+        #         print(f"Mixed steps in batch: {steps}")
 
         cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
 
@@ -494,11 +503,6 @@ class TRM_ACT_NuScenes(nn.Module):
     ) -> Tuple[TRM_ACT_NuScenes_Carry, Dict[str, torch.Tensor]]:
 
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        # print(new_inner_carry.z_H.is_contiguous(), new_inner_carry.z_H.storage().data_ptr())
-        # print(new_inner_carry.z_H[0].storage().data_ptr(), new_inner_carry.z_H[1].storage().data_ptr())
-        # print("h stride:", new_inner_carry.z_H.stride(), "storage_offset:", new_inner_carry.z_H.storage_offset())
-        # print("row0 data_ptr:", new_inner_carry.z_H[0].data_ptr(), "offset:", new_inner_carry.z_H[0].storage_offset())
-        # print("row1 data_ptr:", new_inner_carry.z_H[1].data_ptr(), "offset:", new_inner_carry.z_H[1].storage_offset())
 
         new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
         new_prev_loss = torch.where(
@@ -506,6 +510,11 @@ class TRM_ACT_NuScenes(nn.Module):
             torch.full_like(carry.prev_loss, float('inf')),
             carry.prev_loss,
         )
+        # check if halted early (steps reset and previous step was not N_sup-1)
+        if self.training:
+            halted_early = (new_steps == 0) & (carry.steps > 0) & (carry.steps < self.config.halt_max_steps-1)
+            if halted_early.any():
+                print('Halted early! After steps', carry.steps[halted_early].tolist())
 
         new_current_data = {
             k: torch.where(
@@ -517,7 +526,7 @@ class TRM_ACT_NuScenes(nn.Module):
         }
 
         new_inner_carry, pred, (q_halt_logits, q_continue_logits), global_latent, pred_recursions = self.inner(
-            new_inner_carry, new_current_data
+            new_inner_carry, new_current_data, new_steps
         )
 
         outputs = {
@@ -536,6 +545,7 @@ class TRM_ACT_NuScenes(nn.Module):
             if self.training and (self.config.halt_max_steps > 1):
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)
+                    if (q_halt_logits > 0).any(): print('Will halt early! Q_halt_logits:', [q_halt_logits>0])
                 else:
                     halted = halted | (q_halt_logits > q_continue_logits)
 
