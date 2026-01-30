@@ -101,7 +101,7 @@ class ACTLossHead(nn.Module):
 
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
 
-def traj_loss_smooth_l1_from_batch(pred, targets, targets_mask, out_slice=2):
+def traj_loss_smooth_l1_from_batch(pred, targets, targets_mask, out_slice=2, velocity=False, vel_scaler=0.05):
     """
     pred:         [B, A, H, out_dim]   (from model)
     targets:      [B, H, A, 7]
@@ -113,7 +113,18 @@ def traj_loss_smooth_l1_from_batch(pred, targets, targets_mask, out_slice=2):
 
     pred_xy = pred[..., :out_slice]
     loss = torch.nn.functional.smooth_l1_loss(pred_xy, tgt, reduction="none").sum(-1)  # [B,A,H]
-    return (loss * m).sum(dim=(1,2)) / (m.sum(dim=(1,2)) + 1e-6)
+    reduced_loss = (loss * m).sum(dim=(1,2)) / (m.sum(dim=(1,2)) + 1e-6)
+
+    if velocity:
+        assert vel_scaler is not None, "Must specify a scaler for velocity loss"
+        tgt_vel = tgt[:,:,1:,:] - tgt[:,:,:-1,:]
+        m_vel = m[:,:,1:] & m[:,:,:-1]
+        pred_vel = pred_xy[:,:,1:,:] - pred_xy[:,:,:-1,:]
+        loss_vel = torch.nn.functional.smooth_l1_loss(pred_vel, tgt_vel, reduction="none").sum(-1)
+        reduced_loss_vel = (loss_vel * m_vel).sum(dim=(1,2)) / (m_vel.sum(dim=(1,2)) + 1e-6)
+        reduced_loss = reduced_loss + vel_scaler*reduced_loss_vel
+
+    return reduced_loss
 
 class ACTLossHeadNuScenes(nn.Module):
     def __init__(self, model: nn.Module, halt_eps=0.01):

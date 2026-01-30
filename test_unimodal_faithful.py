@@ -112,7 +112,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
         optimizers=[None],
         optimizer_lrs=[None],
         optimizer_lr_schedule=False,
-        optimizer_lr_min_ratio=1.0,
+        optimizer_lr_min_ratio=0.01,
         optimizer_lr_warmup_steps=2000,
         carry=None
     )
@@ -161,11 +161,10 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                     carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                 )
                 inference_steps += 1
-                supervisions.append(outputs["pred"])
+                supervisions.append((outputs["pred"], outputs["pred_recursions"]))
 
                 if all_finish:
                     break
-            supervisions = torch.stack(supervisions, dim=0)
 
             # plot batch
             plot_test_batch(
@@ -222,38 +221,26 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                 # print(pred_recursions[:,0,0,0])
                 # raise NotImplementedError
                 valid_batch_idxs = valid_agent_idxs = None
-                for cycle in range(pred_recursions.size(0)):
-                    recursion_out = train_state.model.decode(pred_recursions[cycle], model_input)
-                    valid_batch_idxs, valid_agent_idxs = plot_test_batch(
-                        dataset,
-                        batch,
-                        b,
-                        recursion_out,
-                        device,
-                        run_name=f'recursions_{RUN_NAME}',
-                        out_slice=config_dict["out_slice"],
-                        sub_name=args.tboard_name,
-                        filename=f'recursion{cycle}',
-                        valid_batch_idxs=valid_batch_idxs,
-                        valid_agent_idxs=valid_agent_idxs,
-                    )
-
-                valid_batch_idxs = valid_agent_idxs = None
-                for cycle in range(supervisions.size(0)):
-                    supervision_out = supervisions[cycle]
-                    valid_batch_idxs, valid_agent_idxs = plot_test_batch(
-                        dataset,
-                        batch,
-                        b,
-                        supervision_out,
-                        device,
-                        run_name=f'supervisions_{RUN_NAME}',
-                        out_slice=config_dict["out_slice"],
-                        sub_name=args.tboard_name,
-                        filename=f'supervision{cycle}',
-                        valid_batch_idxs=valid_batch_idxs,
-                        valid_agent_idxs=valid_agent_idxs,
-                    )
+                for s, sup in enumerate(supervisions):
+                    pred, z_Hs = sup
+                    for cycle in range(z_Hs.size(0)):
+                        if cycle == z_Hs.size(0)-1: # for last recursion, we already have the output prediction
+                            recursion_out = pred
+                        else:
+                            recursion_out = train_state.model.decode(z_Hs[cycle], model_input)
+                        valid_batch_idxs, valid_agent_idxs = plot_test_batch(
+                            dataset,
+                            batch,
+                            b,
+                            recursion_out,
+                            device,
+                            run_name=f'recursions_{RUN_NAME}',
+                            out_slice=config_dict["out_slice"],
+                            sub_name=args.tboard_name,
+                            filename=f'supervision{s}_recursion{cycle}',
+                            valid_batch_idxs=valid_batch_idxs,
+                            valid_agent_idxs=valid_agent_idxs,
+                        )
 
     ave_ade = ade_sum / max(n, 1)
     ave_fde = fde_sum / max(n, 1)

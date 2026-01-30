@@ -282,7 +282,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
             if filename is None:
                 filename_ = f"{run_name}_test_batch{batch_num}_sample{s}"
             else:
-                filename_ = f"{filename}_batch{batch_num}_sample{s}"
+                filename_ = f"batch{batch_num}_sample{s}_{filename}"
             plot_trajectories(
                 hist_xy,
                 hist_mask_cpu,
@@ -308,7 +308,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
                 if filename is None:
                     filename_ = f"{run_name}_test_batch{batch_num}_sample{s}_agent{a}"
                 else:
-                    filename_ = f"{filename}_batch{batch_num}_sample{s}_agent{a}"
+                    filename_ = f"batch{batch_num}_sample{s}_agent{a}_{filename}"
                 plot_trajectories(
                     hist_xy,
                     hist_mask_cpu,

@@ -36,7 +36,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v5 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -50,7 +50,7 @@ importlib.reload(trm_unimodal)
 #     TRM_ACT_NuScenes_Config
 # )
 importlib.reload(trm_unimodal)
-from models.recursive_reasoning.trm_unimodal_v5 import (
+from models.recursive_reasoning.trm_unimodal_v4 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -276,13 +276,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     # Train state
     train_state = TrainState(
         step=0,
-        total_steps=0, # unused for now
+        total_steps=0,#args.epochs*len(tr_dataloader),
 
         model=ACTLossHeadNuScenes(model=model),
         optimizers=[optimizer],
         optimizer_lrs=[args.lr],
         optimizer_lr_schedule=args.lr_schedule,
-        optimizer_lr_min_ratio=1.0,
+        optimizer_lr_min_ratio=1.0,#0.01,
         optimizer_lr_warmup_steps=2000,
         carry=None
     )
@@ -552,9 +552,6 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         out_slice=config_dict["out_slice"],
                         sub_name=args.tboard_name,
                     )
-
-        # if epoch == 2:
-        #     raise NotImplementedError
 
         logger.log("-" * 30)
 
