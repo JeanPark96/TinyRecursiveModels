@@ -80,6 +80,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
     rope_theta: float = 10000.0
 
     # halting (ACT)
+    halt_config_name: str = ""
     halt_max_steps: int
     halt_exploration_prob: float = 0.0
     no_ACT_continue: bool = True
