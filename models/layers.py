@@ -131,7 +131,8 @@ class Attention(nn.Module):
         query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value)) # needed for scaled_dot_product_attention but not flash_attn_func
         attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
         attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
-        attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        # attn_output = attn_output.view(batch_size, seq_len, self.output_size)  # type: ignore
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
 
 class LinearSwish(nn.Module):
@@ -167,3 +168,30 @@ def rms_norm(hidden_states: torch.Tensor, variance_epsilon: float) -> torch.Tens
     variance = hidden_states.square().mean(-1, keepdim=True)
     hidden_states = hidden_states * torch.rsqrt(variance + variance_epsilon)
     return hidden_states.to(input_dtype)
+
+class EnhancedVideoProjection(nn.Module):
+    def __init__(self, in_dim, hidden_size):
+        super().__init__()
+        self.linear = CastedLinear(in_dim, hidden_size, bias=True)
+        # 1D Convs require (Batch, Channel, Time)
+        # Kernel=3, Padding=1 keeps length the same
+        self.conv1 = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # x: (Batch, Time, Dim)
+        
+        # 1. Project
+        x = self.linear(x) # (B, T, H)
+        
+        # 2. Transpose for Conv1D: (B, T, H) -> (B, H, T)
+        x = x.transpose(1, 2)
+        
+        # 3. Convolutions with ReLU
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        
+        # 4. Transpose back: (B, H, T) -> (B, T, H)
+        x = x.transpose(1, 2)
+        return x
