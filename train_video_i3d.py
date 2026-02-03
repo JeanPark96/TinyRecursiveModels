@@ -36,8 +36,13 @@ from omegaconf import DictConfig
 # new imports
 from dataset.build_charades_sta_snag import *
 # from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
+<<<<<<< HEAD
 from models.act_losses import VideoTRMACTDenseLossHead
 from models.recursive_reasoning.trm_phase1_fixedlen_trunc_grad_dcf import (
+=======
+from models.losses import VideoTRMACTDenseLossHead
+from models.recursive_reasoning.trm_phase1_i3d_fusion import (
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
     Video_TRM_ACT,
     TRMLocalizerConfig
 )
@@ -92,6 +97,10 @@ def train_batch(train_state: TrainState, batch: Any):
     train_state.step += 1
     # if train_state.step > train_state.total_steps:  # At most train_total_steps
     #     return
+<<<<<<< HEAD
+=======
+
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
     # To device
     batch = {k: v.cuda() for k, v in batch.items()}
     batch_size = batch[list(batch.keys())[0]].shape[0]
@@ -102,10 +111,14 @@ def train_batch(train_state: TrainState, batch: Any):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
+<<<<<<< HEAD
     train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry, batch=batch, 
                                                                      return_keys=["logits", "extra_logits"],
                                                                      #global_step=train_state.step,
                                                                      )
+=======
+    train_state.carry, loss, metrics, outputs, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=["logits", "extra_logits"])
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
 
     ((1 / batch_size) * loss).backward()
     
@@ -169,7 +182,22 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
 
     # --- Check for resume ---
     last_ckpt_path = os.path.join(run_ckpt_dir, "last.pth")
+<<<<<<< HEAD
     
+=======
+    # ckpt = None
+    # start_epoch = 0
+    # global_step = 0
+    # best_val_loss = float("inf")
+
+    # if args.resume and os.path.exists(last_ckpt_path):
+    #     print(f"Resuming from checkpoint: {last_ckpt_path}")
+    #     ckpt = torch.load(last_ckpt_path, map_location="cpu")
+    #     config_dict = ckpt["config"]
+    #     start_epoch = ckpt.get("epoch", 0) + 1  # epoch stored as 0-based
+    #     global_step = ckpt.get("global_step", 0)
+    #     best_val_loss = ckpt.get("best_val_loss", float("inf"))
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
     ckpt = None
     start_epoch = 0
     global_step = 0
@@ -289,7 +317,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
         optimizer_lr_schedule=args.lr_schedule,
         optimizer_lr_min_ratio=0.01,
         optimizer_lr_warmup_steps=warmup_steps,
+<<<<<<< HEAD
         carry=None,
+=======
+        carry=None
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
     )
 
 
@@ -326,6 +358,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
                 "video_mask": video_mask,
                 "query_mask": query_mask,
                 "i0": batch["i0"].to(device),
+<<<<<<< HEAD
                 "i1": batch["i1"].to(device),
                 "duration" : batch["duration"].to(device)
             }
@@ -354,6 +387,27 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
                 loc_metric, stats = compute_localization_metric(pred, video_mask, gt_start_sec, gt_end_sec, offsets=extra , max_dur=max_dur, option=args.loss_option)
             elif args.loss_option == "soft_nms":
                 candidates = decode_dense_candidates(pred, extra, video_mask, batch["duration"].to(device), max_vid_len=256)
+=======
+                "i1": batch["i1"].to(device)
+            }
+
+            metrics, outputs = train_batch(train_state, model_input)
+            #batch_target_outputs = train_state.carry.current_data[""]
+            if train_state.step % 200 == 0 and "debug_stats" in outputs:
+                zH = outputs["debug_stats"]["zH"]
+                zL = outputs["debug_stats"]["zL"]
+                logger.log(f"####zH####\n {zH}")
+                logger.log(f"\n*****zL******\n {zL}")
+            # calc extra metrics
+            pred = outputs["logits"]
+            if args.loss_option == "dense_head":
+                if args.feature_type == "i3d":
+                    max_dur = batch["duration"].to(device)
+                    #print(max_dur)
+                loc_metric, stats = compute_localization_metric(pred, video_mask, gt_start_sec, gt_end_sec, offsets=outputs["extra_logits"] , max_dur=max_dur, option=args.loss_option)
+            elif args.loss_option == "soft_nms":
+                candidates = decode_dense_candidates(pred, outputs["extra_logits"], video_mask, batch["duration"].to(device), max_vid_len=256)
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
                 loc_metric, stats = compute_retrieval_metrics(candidates, gt_start_sec, gt_end_sec)
 
             # log metrics
@@ -450,8 +504,12 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
                     inference_steps = 0
                     while True:
                         carry, loss, metrics, outputs, all_finish = train_state.model(
+<<<<<<< HEAD
                             carry=carry, batch=model_input, return_keys=["logits", "extra_logits"],
                             #global_step=train_state.step,
+=======
+                            carry=carry, batch=model_input, return_keys=["logits", "extra_logits"]
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
                         )
                         inference_steps += 1
 
@@ -477,6 +535,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
                             
                     # calc extra metrics
                     pred = outputs["logits"]
+<<<<<<< HEAD
                     extra = outputs["extra_logits"]
 
                     # Handle tuple (Pyramid) output
@@ -489,6 +548,14 @@ def train(args, tr_dataset, val_dataset, test_dataset, tr_dataloader, val_datalo
                         loc_metric, stats = compute_localization_metric(pred, video_mask, gt_start_sec, gt_end_sec, offsets=extra , max_dur=max_dur, option=args.loss_option)
                     elif args.loss_option == "soft_nms":
                         candidates = decode_dense_candidates(pred, extra, video_mask, batch["duration"].to(device), max_vid_len=256)
+=======
+                    if args.loss_option == "dense_head":
+                        if args.feature_type == "i3d":
+                            max_dur = batch["duration"].to(device)
+                        loc_metric, stats = compute_localization_metric(pred, video_mask, gt_start_sec, gt_end_sec, offsets=outputs["extra_logits"] , max_dur=max_dur, option=args.loss_option)
+                    elif args.loss_option == "soft_nms":
+                        candidates = decode_dense_candidates(pred, outputs["extra_logits"], video_mask, batch["duration"].to(device), max_vid_len=256)
+>>>>>>> 0659030b2dfd70038e12f48b6ef8f08840684c0c
                         loc_metric, stats = compute_retrieval_metrics(candidates, gt_start_sec, gt_end_sec)
 
                     # log metrics
