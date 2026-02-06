@@ -118,7 +118,7 @@ def traj_loss_smooth_l1_from_batch(pred, targets, targets_mask, out_slice=2, vel
     if velocity:
         assert vel_scaler is not None, "Must specify a scaler for velocity loss"
         tgt_vel = tgt[:,:,1:,:] - tgt[:,:,:-1,:]
-        m_vel = m[:,:,1:] & m[:,:,:-1]
+        m_vel = (m[:,:,1:].to(torch.bool) & m[:,:,:-1].to(torch.bool)).to(torch.int)
         pred_vel = pred_xy[:,:,1:,:] - pred_xy[:,:,:-1,:]
         loss_vel = torch.nn.functional.smooth_l1_loss(pred_vel, tgt_vel, reduction="none").sum(-1)
         reduced_loss_vel = (loss_vel * m_vel).sum(dim=(1,2)) / (m_vel.sum(dim=(1,2)) + 1e-6)
@@ -127,11 +127,12 @@ def traj_loss_smooth_l1_from_batch(pred, targets, targets_mask, out_slice=2, vel
     return reduced_loss
 
 class ACTLossHeadNuScenes(nn.Module):
-    def __init__(self, model: nn.Module, halt_eps=0.01):
+    def __init__(self, model: nn.Module, halt_eps=0.01, velocity=False):
         super().__init__()
         self.model = model
         self.loss_fn = traj_loss_smooth_l1_from_batch
         self.halt_eps = halt_eps
+        self.velocity = velocity
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -159,7 +160,7 @@ class ACTLossHeadNuScenes(nn.Module):
             # Gain from previous step
             prev_loss = new_carry.prev_loss
             current_loss = traj_loss_smooth_l1_from_batch(
-                outputs["pred"], targets, targets_mask
+                outputs["pred"], targets, targets_mask, velocity=self.velocity
             )  # shape (B,)
 
             current_loss = torch.where( # there may be no agents (halt immediately, nothing to predict)
@@ -197,7 +198,7 @@ class ACTLossHeadNuScenes(nn.Module):
 
         # Losses
         lm = traj_loss_smooth_l1_from_batch(
-            outputs["pred"], targets, targets_mask
+            outputs["pred"], targets, targets_mask, velocity=self.velocity
         )  # shape (B,)
         traj_loss = lm.sum()
 

@@ -29,7 +29,7 @@ import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, select_debug_batch, plot_debug_batch
 from utils.metrics import compute_metrics
-from models.losses import ACTLossHeadNuScenes
+from models.act_losses import ACTLossHeadNuScenes
 import random
 import numpy as np
 import json
@@ -39,6 +39,7 @@ import importlib
 import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
+from utils.halt_helper import load_yaml, build_act_head_kwargs_from_yaml
 
 importlib.reload(trm_unimodal)
 # --- IMPORTS ---
@@ -175,6 +176,16 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
     mean_xy = mean_xy.to(device)
     std_xy = std_xy.to(device)
 
+    # load halt config file
+    halt_cfg_raw = load_yaml(args.halt_config)
+    act_head_kwargs = build_act_head_kwargs_from_yaml(halt_cfg_raw)
+
+    if act_head_kwargs["denorm"]:
+        act_head_kwargs["std_xy"] = std_xy
+        act_head_kwargs["mean_xy"] = mean_xy
+    if args.halt_verbose:
+        act_head_kwargs["verbose"] = True
+
     # --- Infer key dims from a real batch (prevents config mismatch) ---
     sample = next(iter(tr_dataloader))
     # n_history = sample["obs_pose"].shape[1]
@@ -226,9 +237,11 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "halt_max_steps": args.halt_max_steps,
             "halt_exploration_prob": 0.0,
             "no_ACT_continue": True,
+            "velocity_loss": False,
 
             "forward_dtype": "float32",
             "mlp_t": False,
+            "halt_config_name": args.halt_config,
         }
 
         with open(os.path.join("./config", f"{RUN_NAME}.json"), "w") as f:
@@ -278,7 +291,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         step=0,
         total_steps=0,#args.epochs*len(tr_dataloader),
 
-        model=ACTLossHeadNuScenes(model=model),
+        # model=ACTLossHeadNuScenes(model=model, velocity=config_dict['velocity_loss']),
+        model=ACTLossHeadNuScenes(model=model, 
+                                    **act_head_kwargs),
         optimizers=[optimizer],
         optimizer_lrs=[args.lr],
         optimizer_lr_schedule=args.lr_schedule,
@@ -602,6 +617,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_predict", type=int, default=8, help='Max number of obstacles to predict.')
     parser.add_argument("--dynamic_only", action="store_true", help="Only predict dynamic agents.")
     parser.add_argument("--feature_set", type=str, choices=['hpnet'], help="Types of map features to use")
+
+    # halting parameters
+    parser.add_argument( "--halt_config", type=str, required=True, help="Path to YAML config for ACTLossHeadNuScenes halting settings.")
+    parser.add_argument( "--halt_verbose", action='store_true', help="Enable verbose logging for ACT halting decisions.")
 
     args = parser.parse_args()
 

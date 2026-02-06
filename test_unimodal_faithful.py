@@ -5,6 +5,9 @@ import math
 import yaml
 import shutil
 import copy
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import csv
 
 import torch
 import torch.distributed as dist
@@ -25,7 +28,7 @@ from models.ema import EMAHelper
 
 # new imports
 from nuscenes_dataset import load_dataset
-from utils.metrics import compute_metrics
+from utils.metrics import compute_metrics, compute_menger_curvature
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, plot_test_batch
@@ -36,7 +39,7 @@ import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v6 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
 
@@ -44,7 +47,7 @@ importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v4 import (
+from models.recursive_reasoning.trm_unimodal_v6 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -66,6 +69,28 @@ class TrainState:
 
     step: int
     total_steps: int
+
+def curvature_v_metric(hist_curv, fut_curv, metric, metric_name, filename):
+    # cmap = plt.cm.viridis  # pick any colormap you like
+    # norm = mpl.colors.Normalize(vmin=metric.min(), vmax=metric.max())
+    # colors = cmap(norm(metric))  # RGBA colors, shape [N, 4]
+    # sc = plt.scatter(hist_curv, fut_curv, c=metric, cmap=cmap, norm=norm, alpha=0.8, marker='.')
+    # plt.colorbar(sc)
+    hb = plt.hexbin(
+        hist_curv, fut_curv,
+        C=metric,                 # per-point scalar
+        reduce_C_function=np.mean,      # average error in each hex
+        gridsize=45,
+        mincnt=1,                        # ignore empty bins
+        cmap="viridis",
+        )
+    plt.colorbar(hb, label=metric_name)
+
+    plt.xlabel('History curvature')
+    plt.ylabel('Future curvature')
+    plt.title(metric_name)
+    plt.savefig(filename)
+    plt.close()
 
 def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     if ood:
@@ -125,7 +150,8 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     train_state.model.eval()
     ade_sum = fde_sum = ade_real_sum = fde_real_sum = mr_sum = loss_sum = 0.0
     n = 0
-
+    batch_losses, ade_reals, fde_reals, mrs, hist_curv, fut_curv, batch_masks = [], [], [], [], [], [], []
+    agent_losses, agent_ade_reals, agent_fde_reals, agent_mrs, types, track_masks = [], [], [], [], [], []
     with torch.no_grad():
         for b, batch in enumerate(tqdm(dataloader)):
             # if b % 10 == 0:
@@ -176,6 +202,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
                 run_name=f'test_{RUN_NAME}',
                 out_slice=config_dict["out_slice"],
                 sub_name=args.tboard_name,
+                goal_num_samples = obs_pose.size(0),
             )
 
             # Reduce metrics
@@ -202,8 +229,8 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             pred_xy_denorm = pred[..., :2] * std_xy + mean_xy               # [B, A, H, 2]
             targets_xy_denorm = (targets[..., :2] * std_xy + mean_xy)       # [B, H, A, 2]
 
-            ade_real, fde_real, mr = compute_metrics(
-                pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"]
+            ade_real, fde_real, mr, batch_ade, batch_fde, batch_mr, agent_ade, agent_fde, agent_mr = compute_metrics(
+                pred_xy_denorm, targets_xy_denorm, targets_mask, only_full=True, history_mask=obs_mask, targets_idx=targets_idx, out_slice=config_dict["out_slice"], return_unreduced=True
             )
 
             # log metrics
@@ -214,6 +241,38 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             mr_sum += mr
             loss_sum += reduced_metrics['val/loss']
             n += 1
+
+            # save info for stratifying results latter
+            tgt = targets[..., :2].permute(0, 2, 1, 3).contiguous()
+            m = targets_mask.permute(0, 2, 1).to(pred.dtype).contiguous()  # [B, A, H]
+            pred_xy = pred[..., :2] # [B, A, H]
+            loss = torch.nn.functional.smooth_l1_loss(pred_xy, tgt, reduction="none").sum(-1)  # [B,A,H]
+            batch_loss = (loss * m).sum(dim=(1,2)) / (m.sum(dim=(1,2)) + 1e-6) # [B]
+            agent_loss = (loss * m).sum(dim=(2)) / (m.sum(dim=(2)) + 1e-6) # [B, A]
+
+            if args.max_predict < args.max_obstacles:
+                history_mask = obs_mask.gather(dim=2, index=targets_idx[:, None, :].expand(-1,args.n_history,-1)) # [B, H, AF]
+            full_track = (torch.all(history_mask, dim=1) & torch.all(targets_mask, dim=1)) # [B, AF]
+            if args.max_predict < args.max_obstacles:
+                batch_mask = full_track.sum(dim=1) > 0
+            else:
+                raise NotImplementedError
+
+            batch_losses.append(batch_loss)
+            ade_reals.append(batch_ade)
+            fde_reals.append(batch_fde)
+            mrs.append(batch_mr)
+            hist_curv.append(compute_menger_curvature(obs_pose, obs_mask))
+            fut_curv.append(compute_menger_curvature(targets, targets_mask))
+            batch_masks.append(batch_mask)
+
+            agent_losses.append(agent_loss.flatten())
+            agent_ade_reals.append(agent_ade.flatten())
+            agent_fde_reals.append(agent_fde.flatten())
+            agent_mrs.append(agent_mr.flatten())
+            obs_types = dataset.get_obs_type(batch["idx"])
+            types.append(np.take_along_axis(obs_types,axis=1,indices=targets_idx.cpu().numpy()).flatten())
+            track_masks.append(full_track.flatten().cpu().numpy())
 
             # plot recursions
             if b == 0:
@@ -271,6 +330,91 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             f"Miss rate: {mr:.4f}"
         )
         logger.log("Testing Complete.")
+
+    # stratify results
+    logger.log("Stratifying results...")
+
+    hist_curv = torch.cat(hist_curv)
+    fut_curv = torch.cat(fut_curv)
+    batch_losses = torch.cat(batch_losses)
+    ade_reals = torch.cat(ade_reals)
+    fde_reals = torch.cat(fde_reals)
+    mrs = torch.cat(mrs)
+    batch_masks = torch.cat(batch_masks)
+    
+    types = np.concatenate(types)
+    track_masks = np.concatenate(track_masks)
+    agent_losses = torch.cat(agent_losses)
+    agent_ade_reals = torch.cat(agent_ade_reals)
+    agent_fde_reals = torch.cat(agent_fde_reals)
+    agent_mrs = torch.cat(agent_mrs)
+
+    print(len(batch_losses), len(ade_reals), len(fde_reals), len(mrs), len(hist_curv), len(fut_curv))
+    print(len(hist_curv[batch_masks]), len(fut_curv[batch_masks]))
+    assert len(batch_losses) == len(hist_curv) == len(fut_curv)
+    assert len(ade_reals) == len(fde_reals) == len(mrs) == len(hist_curv[batch_masks]) == len(fut_curv[batch_masks])
+    assert len(agent_losses) == len(types)
+    assert len(agent_ade_reals) == len(agent_fde_reals) == len(agent_mrs) == len(types[track_masks])
+
+    # based on object type
+    rows = []
+    for obj_type in np.unique(types):
+        type_match = (types == obj_type)
+        full_track_type_match = (types[track_masks] == obj_type)
+        logger.log(
+            f"{obj_type}: "
+            f"Loss: {agent_losses[type_match].mean():.4f} | " # computed over any track
+            f"Real ADE: {agent_ade_reals[full_track_type_match].mean():.4f} | " # computed only over full tracks
+            f"Real FDE: {agent_fde_reals[full_track_type_match].mean():.4f} | " # computed only over full tracks
+            f"Miss rate: {agent_mrs[full_track_type_match].float().mean():.4f}" # computed only over full tracks
+        )
+
+        row = {
+        "obj_type": str(obj_type),
+        "loss": float(agent_losses[type_match].mean()),
+        "real_ADE": float(agent_ade_reals[full_track_type_match].mean()),
+        "real_FDE": float(agent_fde_reals[full_track_type_match].mean()),
+        "miss_rate": float(agent_mrs[full_track_type_match].float().mean()),
+        }
+
+        rows.append(row)
+
+    csv_path = f"plot_figures/test_{RUN_NAME}/{args.tboard_name}/metrics_by_type.csv"
+    fieldnames = list(rows[0].keys())
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # based on curvature
+    all_curvs = torch.stack((hist_curv, fut_curv))
+    mn, mx = all_curvs.min(), all_curvs.max()
+    splits = (mx-mn)/3
+    quarters = [mn + i*splits for i in range(4)]
+    for q in range(3):
+        if q == 2:
+            curv_match = (fut_curv >= quarters[q]) & (fut_curv <= quarters[q+1])
+            full_track_curv_match = (fut_curv[batch_masks] >= quarters[q]) & (fut_curv[batch_masks] <= quarters[q+1])
+        else:
+            curv_match = (fut_curv >= quarters[q]) & (fut_curv < quarters[q+1])
+            full_track_curv_match = (fut_curv[batch_masks] >= quarters[q]) & (fut_curv[batch_masks] < quarters[q+1])
+        logger.log(
+            f"[{quarters[q]:.2f}, {quarters[q+1]:.2f}): "
+            f"Loss: {batch_losses[curv_match].mean():.4f} | "
+            f"Real ADE: {ade_reals[full_track_curv_match].mean():.4f} | "
+            f"Real FDE: {fde_reals[full_track_curv_match].mean():.4f} | "
+            f"Miss rate: {mrs[full_track_curv_match].mean():.4f}"
+        )
+
+    # plot curvatures vs metrics
+    hist_curv = hist_curv.cpu().numpy()
+    fut_curv = fut_curv.cpu().numpy()
+    batch_masks = batch_masks.cpu().numpy()
+    curvature_v_metric(hist_curv, fut_curv, batch_losses.cpu().numpy(), 'loss', f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/curvature_v_loss.png')
+    curvature_v_metric(hist_curv[batch_masks], fut_curv[batch_masks], ade_reals.cpu().numpy(), 'ADE (m)', f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/curvature_v_ade.png')
+    curvature_v_metric(hist_curv[batch_masks], fut_curv[batch_masks], fde_reals.cpu().numpy(), 'FDE (m)', f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/curvature_v_fde.png')
+    curvature_v_metric(hist_curv[batch_masks], fut_curv[batch_masks], mrs.cpu().numpy(), 'miss rate', f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/curvature_v_mr.png')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

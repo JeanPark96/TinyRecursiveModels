@@ -218,6 +218,110 @@ class Attention_Mask(nn.Module):
         attn_output = attn_output.view(batch_size, seq_len, self.output_size)
         return self.o_proj(attn_output)
 
+class AgentFormer_Attention_Mask(nn.Module):
+    def __init__(self, hidden_size, head_dim, num_heads, num_key_value_heads, n_steps, n_agents, causal=False):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.head_dim = head_dim
+        self.output_size = head_dim * num_heads
+        self.num_heads = num_heads
+        self.num_key_value_heads = num_key_value_heads
+        self.causal = causal
+        self.steps = n_steps
+        self.n_agents = n_agents
+        
+        # Q/K for same-agent
+        self.qk_proj_self = CastedLinear(self.hidden_size, (self.num_heads + self.num_key_value_heads) * self.head_dim, bias=False)
+
+        # Q/K for other-agent
+        self.qk_proj_other = CastedLinear(self.hidden_size, (self.num_heads + self.num_key_value_heads) * self.head_dim, bias=False)
+
+        # Shared V (unchanged conceptually)
+        self.v_proj = CastedLinear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+
+        self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor = None, token_mask: torch.Tensor = None) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+        assert seq_len == self.steps*self.n_agents+1
+
+        # construct agent mask
+        agent_ids = torch.empty(seq_len, device=hidden_states.device, dtype=torch.long)
+        agent_ids[0] = -1  # global token
+        agent_ids[1:] = torch.arange(seq_len-1, device=hidden_states.device) // self.steps
+
+        same_agent = agent_ids[:, None] == agent_ids[None, :]
+        same_agent[agent_ids == -1, :] = False
+        same_agent[:, agent_ids == -1] = False
+
+        # hidden_states: [bs, seq_len, num_heads, head_dim]
+        qk_self = self.qk_proj_self(hidden_states)
+        qk_other = self.qk_proj_other(hidden_states)
+        value = self.v_proj(hidden_states)
+
+        # Split head
+        qk_self = qk_self.view(batch_size, seq_len, self.num_heads + self.num_key_value_heads, self.head_dim)
+        qk_other = qk_other.view(batch_size, seq_len, self.num_heads + self.num_key_value_heads, self.head_dim)
+        value = value.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+
+        q_self, k_self = qk_self[:, :, :self.num_heads], qk_self[:, :, self.num_heads:]
+        q_other, k_other = qk_other[:, :, :self.num_heads], qk_other[:, :, self.num_heads:]
+
+        # [B, H, S, D]
+        q_self, k_self, q_other, k_other, value = map(
+            lambda t: einops.rearrange(t, 'B S H D -> B H S D'),
+            (q_self, k_self, q_other, k_other, value)
+        )
+
+        # Compute logits
+        logits_self  = torch.matmul(q_self, k_self.transpose(-1, -2)) # [B, H, S, S]
+        logits_other = torch.matmul(q_other, k_other.transpose(-1, -2)) # [B, H, S, S]
+
+        # Mix using agent mask
+        attn_weight = torch.where(same_agent[None, None, :, :], logits_self, logits_other) # [B, H, S, S]
+        attn_weight = attn_weight / math.sqrt(self.head_dim) # [B, H, S, S]
+
+        # apply attention mask
+        eye = torch.eye(seq_len, device=attention_mask.device, dtype=torch.bool)
+        attention_mask = attention_mask | eye[None, None, :, :]
+
+        attn_bias = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=q_self.dtype, device=q_self.device)
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                attn_bias.masked_fill_(attention_mask.logical_not(), float("-inf"))
+            else:
+                attn_bias = attention_mask + attn_bias
+        # attn_weight = attn_weight.masked_fill(~attention_mask, float("-inf")) # [B, H, S, S]
+        attn_weight += attn_bias
+        # if attn_weight.isnan().any():
+        #     print(attn_weight)
+        #     print('attn weight')
+        #     raise NotImplementedError
+
+        # compute attention output
+        attn = torch.softmax(attn_weight, dim=-1) # [B, H, S, S]
+        # if attn.isnan().any():
+        #     print(attn)
+        #     print('attn')
+        #     bad = torch.isinf(attn_weight).all(dim=-1)  # [B, H, S]
+        #     print("queries with all keys masked:", bad.any())
+        #     raise NotImplementedError
+        attn_output = attn @ value # [B, H, S, D]
+
+        # output head
+        attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
+        attn_output = attn_output.reshape(batch_size, seq_len, self.output_size)
+        if token_mask is not None:
+            attn_output = attn_output * token_mask[:, :, None]
+
+        # if attn_output.isnan().any():
+        #     print(attn_output)
+        #     print('attn out')
+        #     raise NotImplementedError
+        return self.o_proj(attn_output)        
+
+
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
         super().__init__()

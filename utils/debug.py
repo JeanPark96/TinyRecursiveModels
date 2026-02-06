@@ -3,16 +3,27 @@ import torch
 import os
 import numpy as np
 
-def get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples):
+def get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples, ignore_insufficient_agents=True, only_full=False):
     '''
-    From mask, choose only indices with non-null agent slots (history mask is not completely zero)
+    From mask, choose only indices with valid agent slots
+
+    ignore_insufficient_agents: if fewer than goal_num_agents are valid, then skip that sample
+    
+    if only_full=True: valid means there is at least one non-null timestep (history mask is not completely zero)
+    if only_full=False: valid means there are only non-null timesteps (history and future mask are both all 1)
     '''
-    valid = targets_mask.detach().cpu().any(axis=1)    # (B, A) bool
+    if only_full:
+        valid = obs_mask.detach().cpu().all(axis=1) & targets_mask.detach().cpu().all(axis=1) # (B, A) bool
+    else:
+        valid = targets_mask.detach().cpu().any(axis=1)    # (B, A) bool
 
     _, _, A = targets_mask.shape
     goal_num_agents = min(A, goal_num_agents)
     
-    valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
+    if ignore_insufficient_agents:
+        valid_batches = np.where(valid.sum(axis=1) >= goal_num_agents)[0] # (B, )
+    else:
+        valid_batches = np.where(valid.sum(axis=1) > 0)[0]
     if goal_num_agents == 0 and len(valid_batches) == 0:
         return None, None
 
@@ -251,7 +262,7 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
     obs_mask = batch["obs_mask"].to(device)
     targets = batch["targets"].to(device)
     targets_mask = batch.get("targets_mask", None)
-    targets_idx = batch.get("targets_idx", None).to(device)
+    targets_idx = batch.get("targets_idx", None).to(device) # [B, Aout]
     if targets_mask is None:
         targets_mask = (targets[..., :2].abs().sum(dim=-1) > 1e-3).to(obs_pose.dtype)
     else:
@@ -259,14 +270,20 @@ def plot_test_batch(dataset, batch, batch_num, outputs, device, run_name, out_sl
     sample_idx = batch["idx"]                            # [B]
     obs_types = dataset.get_obs_type(sample_idx)      # [B, A]  
     pred = outputs["pred"] if isinstance(outputs, dict) else outputs
+
+    B, H, A, D = obs_pose.shape
+
+    if obs_pose.size(2) > targets.size(2):
+        obs_pose = obs_pose.gather(index=targets_idx[:,None,:,None].expand(-1,H,-1,D), dim=2)
+        obs_mask = obs_mask.gather(index=targets_idx[:,None,:].expand(-1,H,-1), dim=2)
+        obs_types = np.take_along_axis(obs_types, indices=targets_idx.cpu().numpy(), axis=1)
     
-    B, _, A, _ = obs_pose.shape
     goal_num_agents = min(goal_num_agents, A)
     goal_num_samples = min(goal_num_samples, B)
 
     # choose only indices with non-null agent slots (history mask is not completely zero)
     if valid_batch_idxs is None and valid_agent_idxs is None:
-        valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples)
+        valid_batch_idxs, valid_agent_idxs = get_random_valid_samples(obs_mask, targets_mask, goal_num_agents, goal_num_samples, ignore_insufficient_agents=False, only_full=True)
         if valid_batch_idxs is None:
             return
 

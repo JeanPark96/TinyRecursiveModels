@@ -8,14 +8,15 @@ from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
 from models.layers import (
-    rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, Attention_Mask,
+    rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, Attention_Mask, AgentFormer_Attention_Mask,
     CastedEmbedding, CastedLinear, SinusoidalPositionEmbeddings
 )
 
 '''
 V6 is based off of V4.
+V5, which primarily added computing deltas relative to previous timestep, is skipped due to poor performance.
 Major changes in this version:
-    Add causality in attention masking
+    Add agentformer-style agent aware attention
 '''
 
 # =========================
@@ -76,6 +77,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
     rope_theta: float = 10000.0
 
     # halting (ACT)
+    halt_config_name: str = ""
     halt_max_steps: int
     halt_exploration_prob: float = 0.0
     no_ACT_continue: bool = True
@@ -87,6 +89,7 @@ class TRM_ACT_NuScenes_Config(BaseModel):
 # =========================
 # Block / Reasoning Module
 # =========================
+verbose = False
 
 class TRM_ACT_NuScenes_Block(nn.Module):
     def __init__(self, config: TRM_ACT_NuScenes_Config) -> None:
@@ -97,48 +100,77 @@ class TRM_ACT_NuScenes_Block(nn.Module):
         if self.config.mlp_t:
             self.mlp_t = SwiGLU(hidden_size=self.config.seq_len, expansion=config.expansion)
         else:
-            self.self_attn = Attention_Mask(
+            self.self_attn = AgentFormer_Attention_Mask(
                 hidden_size=config.hidden_size,
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
                 causal=False,
+                n_steps=config.n_history,
+                n_agents=config.max_obstacles,
             )
-
+            
         self.mlp = SwiGLU(hidden_size=config.hidden_size, expansion=config.expansion)
+        self.alpha = nn.Parameter(torch.tensor(-5.0))  # sigmoid ≈ 0.0067
 
     def forward(
         self,
         cos_sin: CosSin,
         hidden_states: torch.Tensor,
         token_mask: Optional[torch.Tensor] = None,  # [B, L_total] boolean mask
+        cross_agent = True
     ) -> torch.Tensor:
+        # gate = torch.sigmoid(self.alpha)
         if self.config.mlp_t:
             hs = hidden_states.transpose(1, 2)
             out = self.mlp_t(hs)
             hs = rms_norm(hs + out, variance_epsilon=self.norm_eps)
             hidden_states = hs.transpose(1, 2)
-        else:
+        else:            
             # attn_mask = token_mask[:,None,None,:].expand(-1,1,hidden_states.size(1),-1) # [B, 1, L, L]
-        
-            t = torch.arange(self.config.n_history)              # 0, 1, ..., H-1
-            times_agent = t.unsqueeze(0).repeat(self.config.max_obstacles, 1) # [A, H]   
-            times_flat = times_agent.reshape(-1) # [A*H]
-            times_special = torch.tensor([self.config.n_history-1])  # or -1
-            times = torch.cat([times_flat, times_special], dim=0) # [A*H+1]
-            times = times.unsqueeze(0).expand(hidden_states.size(0), -1)  # [B, A*H+1]
-            ti = times.unsqueeze(-1)   # [B, A*H+1, 1]
-            tj = times.unsqueeze(-2)   # [B, 1, A*H+1]
-            causal_mask = (tj <= ti).to(token_mask.device)     # [B, A*H+1, A*H+1]
-            # Expand valid mask over query dimension
-            valid_keys = token_mask.unsqueeze(1)          # [A*H+1, 1, N]
-            # Combine
-            attn_mask = causal_mask & valid_keys     # [B, N, N]
-            attn_mask = causal_mask[:,None,:,:].to(torch.bool) # [B, 1, A*H+1, A*H+1]
 
-            # tokens shape: [B, A*T, D]
+            exists = token_mask.to(torch.bool)
+            attn_mask = (
+                exists[:, :, None] & exists[:, None, :]
+            )  # [B, L, L]
+            attn_mask = attn_mask[:, None, :, :]  # [B, 1, L, L]
+
+            if not cross_agent:
+                A = self.config.max_obstacles
+                H = self.config.n_history
+                L = A*H+1
+                mask = torch.zeros((L, L), dtype=torch.bool, device=token_mask.device)
+
+                # ---- read-only global token rules ----
+                allow_global_to_all = False
+                allow_all_to_global = True
+
+                if allow_global_to_all:
+                    mask[0, :] = True
+                if allow_all_to_global:
+                    mask[:, 0] = True
+
+                # ---- agent tokens ----
+                agent_ids = (
+                    torch.arange(A, device=token_mask.device)
+                    .repeat_interleave(H)
+                )  # [A*H]
+
+                # shift by 1 because of global token
+                agent_ids = agent_ids + 1  # token indices start at 1
+
+                # allow intra-agent attention
+                same_agent = agent_ids[:, None] == agent_ids[None, :]
+                mask[1:, 1:] = same_agent
+            
+                attn_mask = attn_mask & mask[None,None,:,:].expand(attn_mask.size(0),-1,-1,-1)
+            
+            # hidden_states = rms_norm(
+            #     hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attention_mask=attn_mask),
+            #     variance_epsilon=self.norm_eps,
+            # )
             hidden_states = rms_norm(
-                hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attention_mask=attn_mask),
+                hidden_states + self.self_attn(hidden_states=hidden_states, attention_mask=attn_mask, token_mask=token_mask),
                 variance_epsilon=self.norm_eps,
             )
 
@@ -148,6 +180,7 @@ class TRM_ACT_NuScenes_Block(nn.Module):
         # pragmatic padding containment if Attention has no mask support
         if token_mask is not None:
             hidden_states = hidden_states * token_mask[..., None].to(hidden_states.dtype)
+            if verbose: print(f'after mask: {hidden_states[0,1:1+to_print,0]}')
 
         return hidden_states
 
@@ -325,42 +358,24 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
             history_kv = history_kv.gather(dim=1, index=targets_idx[:,:,None,None].expand(-1,-1,T_obs,D))
         history_kv = history_kv.view(B * Aout, T_obs, D)
 
-        # 3. Expand future queries: [B, Aout*T_pred, D]
+        # 3. Expand future queries: [B*Aout, T_pred, D]
         queries = self.future_queries.expand(B * Aout, -1, -1, -1).reshape(B * Aout, T_pred, D)
+
+        # add extra agent conditioning in queries
+        # agent_summary = history_kv[:, -1]                 # [B*Aout, D]
+        # agent_cond = self.agent_proj(agent_summary)       # [B*Aout, D]
+        # queries = base_queries + agent_cond[:,None,:] 
 
         # 4. Cross Attention: Future queries attend to history
         #    attn_out: [B, Aout*T_pred, D]
         # key_padding_mask = batch["obs_mask"].gather(dim=2, index=targets_idx[:,None,:].expand(-1,T_obs,-1))
-        # key_padding_mask = ~key_padding_mask.to(torch.bool).permute(0,2,1).contiguous().view(B*Aout, T_obs)
-
-        history_valid = batch["obs_mask"].gather(dim=2, index=targets_idx[:,None,:].expand(-1,T_obs,-1))
-        history_valid = ~history_valid.to(torch.bool).permute(0,2,1).contiguous().view(B*Aout, T_obs)
-        agent_valid = history_valid.any(dim=1)  # [B*Aout]
-        valid_idx = agent_valid.nonzero(as_tuple=True)[0]
-        queries = queries[valid_idx]
-        history_kv   = history_kv[valid_idx]
-        key_padding_mask = ~history_valid[valid_idx]  # [BAv, T_obs]
-
-        attn_out_, _ = self.decoder_attn(
+        # key_padding_mask = ~key_padding_mask.to(torch.bool).permute(0,2,1).contiguous().view(B, Aout*T_obs)
+        attn_out, _ = self.decoder_attn(
             query=queries,
             key=history_kv,
             value=history_kv,
-            key_padding_mask=key_padding_mask,
+            # key_padding_mask=key_padding_mask,
         )
-        attn_out = torch.zeros(
-            B*Aout, T_pred, D,
-            device=history_kv.device,
-            dtype=history_kv.dtype
-        )
-        attn_out[valid_idx] = attn_out_
-
-        # key_padding_mask: [BA, H] where True = masked
-        # num_valid_keys = (~key_padding_mask).sum(dim=1)  # [BA]
-        # print(num_valid_keys.min(), num_valid_keys.max())
-
-        assert torch.isfinite(queries).all()
-        assert torch.isfinite(history_kv).all()
-        assert torch.isfinite(attn_out).all()
 
         # 5. Project to output dim: [B, Aout*T_pred, out_dim]
         pred_flat = self.output_proj(attn_out)
@@ -387,7 +402,13 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         self,
         carry: TRM_ACT_NuScenes_InnerCarry,
         batch: Dict[str, torch.Tensor],
+        steps=None,
     ) -> Tuple[TRM_ACT_NuScenes_InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+
+        # check if ACT halting is doing anything
+        # if steps is not None and self.training:
+        #     if (steps != steps[0]).any():
+        #         print(f"Mixed steps in batch: {steps}")
 
         cos_sin = self.rotary_emb() if hasattr(self, "rotary_emb") else None
 
@@ -397,22 +418,19 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
 
         z_H, z_L = carry.z_H, carry.z_L
         pred_recursions = [z_H]
-        print(f'\nz_H 0: {z_H[0,:3,0]}, z_L 0: {z_L[0,:3,0]}')
 
         # H_cycles-1 without grad
         with torch.no_grad():
             for _ in range(self.config.H_cycles - 1):
                 for _ in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
-                z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
+                    z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask, cross_agent=False)
+                z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask, cross_agent=True)
                 pred_recursions.append(z_H)
-                print(f'z_H mid: {z_H[0,:3,0]}, z_L mid: {z_L[0,:3,0]}')
         # 1 with grad
         for _ in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask)
-        z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask)
+            z_L = self.L_level(z_L, z_H + input_embeddings, cos_sin=cos_sin, token_mask=full_mask, cross_agent=False)
+        z_H = self.L_level(z_H, z_L, cos_sin=cos_sin, token_mask=full_mask, cross_agent=True)
         pred_recursions.append(z_H)
-        print(f'z_H last: {z_H[0,:3,0]}, z_L last: {z_L[0,:3,0]}')
         
         pred_recursions = torch.stack(pred_recursions, dim=0)
 
@@ -424,8 +442,6 @@ class TRM_ACT_NuScenes_Inner(nn.Module):
         # Q head on global token
         q_logits = self.q_head(global_latent).to(torch.float32)
         q_halt_logits, q_continue_logits = q_logits[..., 0], q_logits[..., 1]
-        print(f'Q halt: {q_halt_logits[0:10]}')
-        print(f'Q continue: {q_continue_logits[0:10]}')
 
         # =================================================================
         # Query-Based Decoding Implementation
@@ -467,12 +483,18 @@ class TRM_ACT_NuScenes(nn.Module):
     ) -> Tuple[TRM_ACT_NuScenes_Carry, Dict[str, torch.Tensor]]:
 
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
+
         new_steps = torch.where(carry.halted, torch.zeros_like(carry.steps), carry.steps)
         new_prev_loss = torch.where(
             carry.halted,
             torch.full_like(carry.prev_loss, float('inf')),
             carry.prev_loss,
         )
+        # check if halted early (steps reset and previous step was not N_sup-1)
+        if self.training:
+            halted_early = (new_steps == 0) & (carry.steps > 0) & (carry.steps < self.config.halt_max_steps-1)
+            if halted_early.any():
+                print('Halted early! After steps', carry.steps[halted_early].tolist())
 
         new_current_data = {
             k: torch.where(
@@ -484,7 +506,7 @@ class TRM_ACT_NuScenes(nn.Module):
         }
 
         new_inner_carry, pred, (q_halt_logits, q_continue_logits), global_latent, pred_recursions = self.inner(
-            new_inner_carry, new_current_data
+            new_inner_carry, new_current_data, new_steps
         )
 
         outputs = {
@@ -503,6 +525,7 @@ class TRM_ACT_NuScenes(nn.Module):
             if self.training and (self.config.halt_max_steps > 1):
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)
+                    # if (q_halt_logits > 0).any(): print('Will halt early! Q_halt_logits:', q_halt_logits[q_halt_logits>0])
                 else:
                     halted = halted | (q_halt_logits > q_continue_logits)
 
