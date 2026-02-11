@@ -27,6 +27,7 @@ class IRLRConfig:
     dropout: float = 0.1
     sigma_max: float = 3.0
     alpha_mask: float = 1.0       # weight for mask loss
+    alpha_entropy: float = 0.1    # weight for entropy regularization
     # Input dimensions (set from actual batch shapes):
     video_feat_dim: int = 2048
     text_word_dim: int = 300      # query_tokens last dim
@@ -64,17 +65,42 @@ def blur_mask(m_gt, sigma):
     return blurred.clamp(0.0, 1.0)
 
 
-def compute_mask_loss(masks, gt_mask, R, sigma_max):
-    """Deep supervision loss: each iteration gets a progressively sharper target."""
-    total_loss = 0.0
+def mask_entropy(m):
+    """Binary entropy of mask values in [0, 1]. High = uncertain, low = sharp."""
+    mc = m.clamp(1e-6, 1 - 1e-6)
+    return -(mc * mc.log() + (1 - mc) * (1 - mc).log()).mean()
+
+
+def compute_mask_loss(masks, gt_mask, R, sigma_max, alpha_entropy=0.0):
+    """
+    Deep supervision loss with entropy regularization.
+
+    BCE: each iteration gets a progressively sharper target.
+    Entropy: early iterations are encouraged to be uncertain (high entropy),
+             later iterations are encouraged to be sharp (low entropy).
+             This prevents all iterations from collapsing to the same mask.
+    """
+    total_bce = 0.0
+    total_entropy_reg = 0.0
     per_iter_losses = []
+
     for r in range(R):
         sigma = sigma_max * (1.0 - (r + 1) / R)
         target = blur_mask(gt_mask, sigma)
         iter_loss = F.binary_cross_entropy(masks[r], target)
         per_iter_losses.append(iter_loss.item())
-        total_loss += iter_loss
-    return total_loss / R, per_iter_losses
+        total_bce += iter_loss
+
+        # Entropy regularization: target entropy decreases with iteration
+        # Iter 0 (coarse) → high target entropy, Iter R-1 (fine) → low target entropy
+        if alpha_entropy > 0:
+            actual_ent = mask_entropy(masks[r])
+            # Target entropy: linearly decrease from ~0.6 (soft) to ~0.05 (sharp)
+            target_ent = 0.6 * (1.0 - (r + 1) / R) + 0.05
+            total_entropy_reg += (actual_ent - target_ent) ** 2
+
+    total_loss = total_bce / R + alpha_entropy * total_entropy_reg / R
+    return total_loss, per_iter_losses
 
 
 # =============================================================================
@@ -117,12 +143,22 @@ class MaskedCrossAttention(nn.Module):
 # =============================================================================
 
 class IRLRSharedBlock(nn.Module):
-    def __init__(self, d_model, num_heads, ffn_ratio=4, dropout=0.1):
+    def __init__(self, d_model, num_heads, R=4, ffn_ratio=4, dropout=0.1):
         super().__init__()
         self.d_model = d_model
+        self.R = R
         self.W_a = nn.Linear(d_model, d_model, bias=False)
         nn.init.xavier_uniform_(self.W_a.weight, gain=0.1)
-        self.mask_scale = nn.Parameter(torch.tensor(1.0 / math.sqrt(d_model)))
+
+        # Per-iteration mask temperatures: initialized so early iterations
+        # produce soft masks (low temp → scores compressed → sigmoid ≈ 0.5)
+        # and later iterations produce sharp masks (high temp → scores spread).
+        #   Iter 0: scale ≈ 0.3/sqrt(d)  (soft)
+        #   Iter R-1: scale ≈ 1.0/sqrt(d) (sharp)
+        base = 1.0 / math.sqrt(d_model)
+        init_temps = torch.linspace(0.3 * base, 1.0 * base, R)
+        self.mask_scales = nn.Parameter(init_temps)
+
         self.masked_cross_attn = MaskedCrossAttention(d_model, num_heads, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
@@ -135,9 +171,9 @@ class IRLRSharedBlock(nn.Module):
         )
         self.norm4 = nn.LayerNorm(d_model)
 
-    def forward(self, Z, F_video, Q_words, query_mask=None):
+    def forward(self, Z, F_video, Q_words, iteration_idx, query_mask=None):
         Z_proj = self.W_a(Z)
-        scores = torch.matmul(Z_proj, F_video.transpose(-1, -2)).mean(dim=1) * self.mask_scale
+        scores = torch.matmul(Z_proj, F_video.transpose(-1, -2)).mean(dim=1) * self.mask_scales[iteration_idx]
         m = torch.sigmoid(scores)
 
         cross_out = self.masked_cross_attn(Z, F_video, m)
@@ -193,7 +229,7 @@ class IRLRModule(nn.Module):
         self.iter_embeds = nn.Parameter(torch.randn(cfg.R, 1, d) * 0.02)
 
         # Shared block
-        self.shared_block = IRLRSharedBlock(d, cfg.num_heads, cfg.ffn_ratio, cfg.dropout)
+        self.shared_block = IRLRSharedBlock(d, cfg.num_heads, R=cfg.R, ffn_ratio=cfg.ffn_ratio, dropout=cfg.dropout)
 
         # Reverse cross-attention
         self.reverse_cross_attn = nn.MultiheadAttention(
@@ -230,7 +266,7 @@ class IRLRModule(nn.Module):
         masks = []
         for r in range(self.cfg.R):
             Z_input = Z + self.iter_embeds[r]
-            Z, m_r = self.shared_block(Z_input, F_video, Q_words, query_mask)
+            Z, m_r = self.shared_block(Z_input, F_video, Q_words, iteration_idx=r, query_mask=query_mask)
             masks.append(m_r)
 
         # Reverse cross-attention

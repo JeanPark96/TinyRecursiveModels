@@ -83,7 +83,7 @@ def train_step(model, batch, optimizer, cfg, device, global_step,
 
     # ---- 1. Mask loss (IRLR deep supervision) ----
     gt_mask = make_gt_mask(i0, i1, N).to(device)
-    mask_loss, per_iter_mask_losses = compute_mask_loss(masks, gt_mask, cfg.R, cfg.sigma_max)
+    mask_loss, per_iter_mask_losses = compute_mask_loss(masks, gt_mask, cfg.R, cfg.sigma_max, cfg.alpha_entropy)
 
     # ---- 2. Dense loss (SnAG cls + reg) across pyramid levels ----
     total_dense_loss = torch.tensor(0.0, device=device)
@@ -242,6 +242,7 @@ def train(args, tr_ds, val_ds, test_ds, tr_loader, val_loader, test_loader):
         dropout=args.dropout,
         sigma_max=args.sigma_max,
         alpha_mask=args.alpha_mask,
+        alpha_entropy=args.alpha_entropy,
         video_feat_dim=vid_dim,
         text_word_dim=word_dim,
         text_global_dim=global_dim,
@@ -282,6 +283,7 @@ def train(args, tr_ds, val_ds, test_ds, tr_loader, val_loader, test_loader):
         "R": cfg.R,
         "sigma_max": cfg.sigma_max,
         "alpha_mask": cfg.alpha_mask,
+        "alpha_entropy": cfg.alpha_entropy,
         "dropout": cfg.dropout,
         "video_feat_dim": cfg.video_feat_dim,
         "text_word_dim": cfg.text_word_dim,
@@ -628,6 +630,7 @@ if __name__ == "__main__":
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--sigma_max", type=float, default=3.0)
     parser.add_argument("--alpha_mask", type=float, default=1.0, help="Weight for mask loss")
+    parser.add_argument("--alpha_entropy", type=float, default=0.1, help="Weight for entropy regularization")
 
     # SnAG head
     parser.add_argument("--num_pyramid_levels", type=int, default=3)
