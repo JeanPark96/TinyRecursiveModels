@@ -17,6 +17,8 @@ import torch
 import numpy as np
 from nuscenes.map_expansion.map_api import NuScenesMap
 from tqdm import tqdm
+from collections.abc import Mapping, Sequence
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 DYNAMIC_TYPES = ['animal',
                  'adult', 'child', 'construction_worker', 'personal_mobility', 'police_officer', 'stroller', 'wheelchair',
@@ -123,6 +125,162 @@ class HDF5FeatureLoader:
             self.h5_file.close()
             self.h5_file = None
 
+def quat_to_yaw_torch(qw, qx, qy, qz):
+    """
+    Compute yaw from quaternion (w,x,y,z). Fully vectorized.
+    qw,qx,qy,qz can be any broadcastable shape.
+
+    Returns:
+        yaw: same broadcasted shape, radians in [-pi, pi]
+    """
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return torch.atan2(siny_cosp, cosy_cosp)
+
+
+def wrap_to_pi_torch(x: torch.Tensor) -> torch.Tensor:
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+def batch_hpnet_map_to_ego_per_timestep(
+    batch_map_features,
+    batch_ego_pose,
+    inplace: bool = False,
+):
+    """
+    Convert HPNet-style GLOBAL map features into ego-centric map features
+    for EACH timestep in the history.
+
+    This is designed to be consistent with your dataloader usage:
+        batch['map_features'] is a list of dicts
+        each dict has keys:
+            'city', 'lane', 'centerline', ('centerline','lane'), ('lane','lane')
+
+    It returns the same structure, but with:
+        data['lane']['position']     : [H, L, 2]
+        data['lane']['heading']      : [H, L]
+        data['centerline']['position']: [H, N, 2]
+        data['centerline']['heading'] : [H, N]
+
+    All other fields remain unchanged:
+        lane.length, lane.is_intersection, lane.turn_direction, lane.traffic_control
+        centerline.length, centerline.num_nodes
+        edge indices
+
+    Args:
+        batch_map_features:
+            list length B of per-sample map dicts (GLOBAL coords)
+        batch_ego_pose:
+            torch.Tensor [B,H,7] = [x,y,z,qw,qx,qy,qz] in GLOBAL coords
+            Must correspond to the same history timesteps used for agents.
+        inplace:
+            if True, modifies the dicts in batch_map_features directly.
+            if False, returns a new list with shallow-copied dicts.
+
+    Returns:
+        batch_map_features_ego:
+            list length B of per-sample dicts, now with per-timestep ego-centric
+            lane/centerline positions/headings.
+    """
+
+    assert isinstance(batch_map_features, list), "batch_map_features must be a list of dicts"
+    assert isinstance(batch_ego_pose, torch.Tensor), "batch_ego_pose must be a torch.Tensor"
+    assert batch_ego_pose.dim() == 3 and batch_ego_pose.shape[-1] == 7, \
+        "batch_ego_pose must have shape [B,H,7]"
+
+    B, H, _ = batch_ego_pose.shape
+
+    # yaw per timestep
+    qw = batch_ego_pose[:, :, 3]
+    qx = batch_ego_pose[:, :, 4]
+    qy = batch_ego_pose[:, :, 5]
+    qz = batch_ego_pose[:, :, 6]
+    ego_yaw = quat_to_yaw_torch(qw, qx, qy, qz)  # [B,H]
+
+    ego_xy = batch_ego_pose[:, :, :2]  # [B,H,2]
+
+    # We will return a list of dicts, same as input
+    out_list = []
+
+    for b in range(B):
+        d = batch_map_features[b]
+
+        # -----------------------------
+        # Copy dict structure if needed
+        # -----------------------------
+        if inplace:
+            d_out = d
+        else:
+            # Shallow copies: we will overwrite only the tensors we transform
+            d_out = dict(d)
+            d_out["lane"] = dict(d["lane"])
+            d_out["centerline"] = dict(d["centerline"])
+
+            # keep tuple keys intact (same as your expected usage)
+            d_out[("centerline", "lane")] = dict(d[("centerline", "lane")])
+            d_out[("lane", "lane")] = dict(d[("lane", "lane")])
+
+        # -----------------------------
+        # Pull global map tensors
+        # -----------------------------
+        lane_pos_g = d["lane"]["position"]          # [L,2]
+        lane_head_g = d["lane"]["heading"]          # [L]
+        cl_pos_g = d["centerline"]["position"]      # [N,2]
+        cl_head_g = d["centerline"]["heading"]      # [N]
+
+        # Device/dtype consistency
+        device = lane_pos_g.device
+        dtype = lane_pos_g.dtype
+
+        # ego pose for this sample
+        ex = ego_xy[b, :, 0].to(device=device, dtype=dtype)  # [H]
+        ey = ego_xy[b, :, 1].to(device=device, dtype=dtype)  # [H]
+        yaw = ego_yaw[b].to(device=device, dtype=dtype)      # [H]
+
+        c = torch.cos(yaw)  # [H]
+        s = torch.sin(yaw)  # [H]
+
+        # -----------------------------
+        # Transform lane positions: [H,L,2]
+        # -----------------------------
+        L = lane_pos_g.shape[0]
+
+        dx = lane_pos_g[None, :, 0] - ex[:, None]  # [H,L]
+        dy = lane_pos_g[None, :, 1] - ey[:, None]  # [H,L]
+
+        lane_x = c[:, None] * dx + s[:, None] * dy
+        lane_y = -s[:, None] * dx + c[:, None] * dy
+        lane_pos_ego = torch.stack([lane_x, lane_y], dim=-1)  # [H,L,2]
+
+        # lane headings: [H,L]
+        lane_head_ego = wrap_to_pi_torch(lane_head_g[None, :] - yaw[:, None])
+
+        # -----------------------------
+        # Transform centerline positions: [H,N,2]
+        # -----------------------------
+        N = cl_pos_g.shape[0]
+
+        dx = cl_pos_g[None, :, 0] - ex[:, None]  # [H,N]
+        dy = cl_pos_g[None, :, 1] - ey[:, None]  # [H,N]
+
+        cl_x = c[:, None] * dx + s[:, None] * dy
+        cl_y = -s[:, None] * dx + c[:, None] * dy
+        cl_pos_ego = torch.stack([cl_x, cl_y], dim=-1)  # [H,N,2]
+
+        cl_head_ego = wrap_to_pi_torch(cl_head_g[None, :] - yaw[:, None])
+
+        # -----------------------------
+        # Write back into dict
+        # -----------------------------
+        d_out["lane"]["position"] = lane_pos_ego
+        d_out["lane"]["heading"] = lane_head_ego
+
+        d_out["centerline"]["position"] = cl_pos_ego
+        d_out["centerline"]["heading"] = cl_head_ego
+
+        out_list.append(d_out)
+
+    return out_list
+
 def custom_collate(batch):
     'Necessary while LIDAR data list of variable length lists. If LIDAR is converted to BEV, this is no longer necessary'
     collated = {}
@@ -136,6 +294,7 @@ def custom_collate(batch):
     collated['targets_mask']  = torch.stack([b['targets_mask'] for b in batch])
     collated['idx'] = np.stack([b['idx'] for b in batch])
     collated['targets_idx'] = torch.stack([b['targets_idx'] for b in batch])
+    collated['ego_pose'] = torch.stack([b['ego_pose'] for b in batch])
 
     # sensor data is not always used
     if 'camera_F' in batch[0]:
@@ -167,12 +326,18 @@ def custom_collate(batch):
     if 'camera_BR_features' in batch[0]:
         collated['camera_BR_features'] = torch.stack([b['camera_BR_features'] for b in batch])
     if 'map_features' in batch[0]:
-        collated['map_features'] = torch.stack([b['map_features'] for b in batch])
+        batch_map = [b["map_features"] for b in batch]        # list of dicts
+        batch_ego = torch.stack([b["ego_pose"] for b in batch], dim=0)  # [B,H,7]
+        collated["map_features"] = batch_hpnet_map_to_ego_per_timestep(
+            batch_map_features=batch_map,
+            batch_ego_pose=batch_ego,   # [B,H,7]
+            inplace=True
+        )
 
     return collated
 
 class NuScenesDataset(Dataset):
-    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=False, use_lidar=False, use_bev=False, use_map=False, feature_set=None, use_preprocessed=False, feature_path=None, norm_stats=None):
+    def __init__(self, data_pth, raw_data_dir, n_history, n_horizon, max_obstacles, max_predict, dynamic_only=False, use_camera=None, use_lidar=False, use_bev=False, use_map=False, feature_set=None, use_preprocessed=False, feature_path=None, norm_stats=None):
         '''
         data_pth: path to raw data
         data_dir: root of raw data
@@ -191,12 +356,12 @@ class NuScenesDataset(Dataset):
         norm_stats: mean, std to norm pose by
         '''
 
-        self.use_camera_F = use_camera['F']
-        self.use_camera_FL = use_camera['FL']
-        self.use_camera_FR = use_camera['FR']
-        self.use_camera_B = use_camera['B']
-        self.use_camera_BL = use_camera['BL']
-        self.use_camera_BR = use_camera['BR']
+        self.use_camera_F = use_camera['F'] if use_camera is not None else False
+        self.use_camera_FL = use_camera['FL'] if use_camera is not None else False
+        self.use_camera_FR = use_camera['FR'] if use_camera is not None else False
+        self.use_camera_B = use_camera['B'] if use_camera is not None else False
+        self.use_camera_BL = use_camera['BL'] if use_camera is not None else False
+        self.use_camera_BR = use_camera['BR'] if use_camera is not None else False
         self.use_lidar = use_lidar
         self.use_bev = use_bev
         self.use_map = use_map
@@ -287,8 +452,9 @@ class NuScenesDataset(Dataset):
             assert feature_set is not None, 'Must define map features to use'
             assert feature_set in ['hpnet']
             self.map_names = data['map'] # strings: (n_examples, )
+            self._turn_direction_type = ['NONE', 'LEFT', 'RIGHT']
             self.map_features = self.get_map_features(feature_set)
-
+            
     def __len__(self):
         return self.n_samples
 
@@ -333,6 +499,8 @@ class NuScenesDataset(Dataset):
             "obs_pose": norm_obs_pose,             # normalized xyz
             "targets": norm_targets,               # normalized xyz
             'idx': idx,                             # scalar
+            # ego pose for extra analysis
+            "ego_pose": self.ego_pose[idx],
         }
 
         # Helper to handle Feature vs Raw loading
@@ -403,7 +571,6 @@ class NuScenesDataset(Dataset):
             'ego_target':self.ego_target[idx],          # (n_horizon, 7)
             'raw_target':self.raw_target[idx],          # (n_horizon, max_predict, 7)
         }
-    
 
     def compute_normalization_stats(self, max_samples=None):
         """
@@ -468,14 +635,37 @@ class NuScenesDataset(Dataset):
 
     def get_map_features(self, feature_set):
         if feature_set == 'hpnet':
-            return self.get_hpnet_map_features(feature_set)
+            return self.get_hpnet_map_features()
         else:
             raise NotImplementedError
-    
-    def get_hpnet_map_features(self, feature_set, margin=50.0, save=True, pth='map_features/hpnet.pt'):
+        
+    def lane_has_stop_line_fast(self, nusc_map, pts_t, n_check=3):
+        """
+        Check only the last few points of the lane centerline.
+        """
+        if pts_t is None or pts_t.shape[0] < 2:
+            return False
+
+        pts = pts_t.detach().cpu().numpy()
+        idxs = np.linspace(max(0, pts.shape[0] - 1 - 10), pts.shape[0] - 1, n_check).astype(int)
+
+        for j in idxs:
+            x, y = float(pts[j, 0]), float(pts[j, 1])
+            layers = nusc_map.layers_on_point(x, y)
+            if len(layers.get("stop_line", [])) > 0:
+                return True
+        return False
+
+    def get_hpnet_map_features(self, margin=50.0, save=True, pth='map_features/hpnet.pt'):
         print('Processing HPNet-style map features...')
+        if os.path.isfile(pth):
+            print('HPNet-style map features already exist. Loading...')
+            map_features = torch.load(pth)
+            return map_features
+
         if save:
-            os.make_dirs(pth, exist_ok=True)
+            dr = os.path.dirname(pth)
+            os.makedirs(dr, exist_ok=True)
 
         map_features = []
         for idx in tqdm(range(self.n_samples)):
@@ -494,7 +684,7 @@ class NuScenesDataset(Dataset):
             agent_mask = self.obs_mask[idx] # H, A
 
             # bounding box at current timestep
-            valid_positions = global_agent[-1][agent_mask[-1]>0] # A, 7
+            valid_positions = global_agent[-1][agent_mask[-1]>0] # <A, 7
 
             left_boundary = min(valid_positions[:,0])
             right_boundary = max(valid_positions[:,0])
@@ -537,97 +727,85 @@ class NuScenesDataset(Dataset):
                 # centerline
                 arclines = nusc_map.get_arcline_path(lane_token)
 
-                # Some lanes may not have an arcline definition
-                if arclines is None or len(arclines) == 0:
-                    # Fallback: use lane polygon centroid if available, else skip
-                    poly = nusc_map.get_lane_polygon(lane_token) if hasattr(nusc_map, "get_lane_polygon") else None
-                    if poly is None or len(poly) == 0:
-                        # Make this lane effectively empty
-                        centerline_position[i] = torch.zeros(0, 2)
-                        centerline_heading[i] = torch.zeros(0)
-                        centerline_length[i] = torch.zeros(0)
-                        num_centerlines[i] = 0
+                # nuScenes returns a list of arcline dicts; typically length=1
+                arc = arclines[0]
+                x, y, yaw = arc["start_pose"]          # yaw is in radians in nuScenes maps
+                shape = arc["shape"]                   # e.g., "LSL"
+                r = float(arc["radius"])
+                seg_lens = [float(v) for v in arc["segment_length"]]
+
+                # Sampling resolution (meters). Adjust if you want denser/sparser polylines.
+                ds = 1.0
+
+                pts = [(x, y)]
+
+                def rot2(vx, vy, a):
+                    ca, sa = np.cos(a), np.sin(a)
+                    return ca * vx - sa * vy, sa * vx + ca * vy
+
+                # unit vectors given heading yaw
+                def fwd(th):
+                    return np.cos(th), np.sin(th)
+
+                def left(th):
+                    return -np.sin(th), np.cos(th)
+
+                # reconstruct centerline (in Argoverese, this is given by map_api.get_lane_segment_centerline without any extra work needed)
+                cur_x, cur_y, cur_yaw = x, y, yaw
+
+                for seg_type, L in zip(shape, seg_lens):
+                    if L <= 1e-6:
                         continue
-                    pts_t = torch.from_numpy(np.asarray(poly)[:, :2]).float()
-                else:
-                    # nuScenes returns a list of arcline dicts; typically length=1
-                    arc = arclines[0]
-                    x, y, yaw = arc["start_pose"]          # yaw is in radians in nuScenes maps
-                    shape = arc["shape"]                   # e.g., "LSL"
-                    r = float(arc["radius"])
-                    seg_lens = [float(v) for v in arc["segment_length"]]
 
-                    # Sampling resolution (meters). Adjust if you want denser/sparser polylines.
-                    ds = 1.0
+                    if seg_type == "S":
+                        # Straight segment
+                        n = max(1, int(np.ceil(L / ds)))
+                        step = L / n
+                        fx, fy = fwd(cur_yaw)
+                        for _ in range(n):
+                            cur_x += fx * step
+                            cur_y += fy * step
+                            pts.append((cur_x, cur_y))
 
-                    pts = [(x, y)]
+                    elif seg_type in ("L", "R"):
+                        # Arc segment: angle = arc_length / radius
+                        dtheta = L / r
+                        sign = +1.0 if seg_type == "L" else -1.0
 
-                    def rot2(vx, vy, a):
-                        ca, sa = np.cos(a), np.sin(a)
-                        return ca * vx - sa * vy, sa * vx + ca * vy
-
-                    # unit vectors given heading yaw
-                    def fwd(th):
-                        return np.cos(th), np.sin(th)
-
-                    def left(th):
-                        return -np.sin(th), np.cos(th)
-
-                    cur_x, cur_y, cur_yaw = x, y, yaw
-
-                    for seg_type, L in zip(shape, seg_lens):
-                        if L <= 1e-6:
-                            continue
-
-                        if seg_type == "S":
-                            # Straight segment
-                            n = max(1, int(np.ceil(L / ds)))
-                            step = L / n
-                            fx, fy = fwd(cur_yaw)
-                            for _ in range(n):
-                                cur_x += fx * step
-                                cur_y += fy * step
-                                pts.append((cur_x, cur_y))
-
-                        elif seg_type in ("L", "R"):
-                            # Arc segment: angle = arc_length / radius
-                            dtheta = L / r
-                            sign = +1.0 if seg_type == "L" else -1.0
-
-                            # center of rotation
-                            lx, ly = left(cur_yaw)
-                            if seg_type == "L":
-                                cx = cur_x + r * lx
-                                cy = cur_y + r * ly
-                            else:
-                                cx = cur_x - r * lx
-                                cy = cur_y - r * ly
-
-                            # vector from center to current position
-                            vx = cur_x - cx
-                            vy = cur_y - cy
-
-                            n = max(1, int(np.ceil(abs(dtheta) * r / ds)))  # ~ arc length / ds
-                            step_ang = sign * (abs(dtheta) / n)
-
-                            for _ in range(n):
-                                vx, vy = rot2(vx, vy, step_ang)
-                                cur_x = cx + vx
-                                cur_y = cy + vy
-                                cur_yaw += step_ang
-                                pts.append((cur_x, cur_y))
-
+                        # center of rotation
+                        lx, ly = left(cur_yaw)
+                        if seg_type == "L":
+                            cx = cur_x + r * lx
+                            cy = cur_y + r * ly
                         else:
-                            raise ValueError(f"Unknown arcline segment type '{seg_type}' in shape='{shape}'")
+                            cx = cur_x - r * lx
+                            cy = cur_y - r * ly
 
-                    pts_t = torch.from_numpy(np.asarray(pts, dtype=np.float32)).float()
+                        # vector from center to current position
+                        vx = cur_x - cx
+                        vy = cur_y - cy
+
+                        n = max(1, int(np.ceil(abs(dtheta) * r / ds)))  # ~ arc length / ds
+                        step_ang = sign * (abs(dtheta) / n)
+
+                        for _ in range(n):
+                            vx, vy = rot2(vx, vy, step_ang)
+                            cur_x = cx + vx
+                            cur_y = cy + vy
+                            cur_yaw += step_ang
+                            pts.append((cur_x, cur_y))
+
+                    else:
+                        raise ValueError(f"Unknown arcline segment type '{seg_type}' in shape='{shape}'")
+
+                pts_t = torch.from_numpy(np.asarray(pts, dtype=np.float32)).float()
 
                 # If we ended up with too few points, make it non-empty but safe
                 if pts_t.shape[0] < 2:
                     centerline_position[i] = pts_t[:, :2]
                     centerline_heading[i] = torch.zeros(0)
                     centerline_length[i] = torch.zeros(0)
-                    num_centerlines[i] = pts_t.shape[0]
+                    num_centerlines[i] = pts_t.shape[0] - 1
                     lane_position[i] = pts_t[:1, :2].mean(dim=0) if pts_t.shape[0] > 0 else torch.zeros(2)
                     lane_heading[i] = 0.0
                     lane_length[i] = 0.0
@@ -635,41 +813,42 @@ class NuScenesDataset(Dataset):
                     pts_t = pts_t[:, :2]  # [M, 2]
 
                     deltas = pts_t[1:] - pts_t[:-1]                 # [M-1, 2]
+                    center_pos = (pts_t[1:] + pts_t[:-1]) / 2           # [M-1,2]
                     headings = torch.atan2(deltas[:, 1], deltas[:, 0])
                     seg_len = torch.norm(deltas, dim=-1)            # [M-1]
 
-                    centerline_position[i] = pts_t
+                    centerline_position[i] = center_pos
                     centerline_heading[i] = headings
                     centerline_length[i] = seg_len
-                    num_centerlines[i] = pts_t.shape[0]
+                    num_centerlines[i] = pts_t.shape[0] - 1
 
-                    lane_position[i] = pts_t.mean(dim=0)
-                    lane_heading[i] = headings.mean()
+                    center_index = int(num_centerlines[i]/2)
+                    lane_position[i] = pts_t[center_index]
+                    lane_heading[i] = torch.atan2(pts_t[center_index + 1, 1] - pts_t[center_index, 1], 
+                                                 pts_t[center_index + 1, 0] - pts_t[center_index, 0])
                     lane_length[i] = seg_len.sum()
 
-                    lane_is_intersection[i] = int(lane_record.get('is_intersection', False))
-                    lane_turn_direction[i] = int(lane_record.get('turn_direction', 'NONE') != 'NONE')
-                    lane_traffic_control[i] = int(lane_record.get('has_traffic_control', False))
+                    lane_is_intersection[i] = int(lane_token in lane_tokens['lane_connector'])
+                    if headings.numel() < 2: # headings: [M-1] tensor for this lane (segment headings)
+                        lane_turn_direction[i] = self._turn_direction_type.index('NONE')
+                    else:
+                        hd = headings.detach().cpu().numpy()
+                        hd = np.unwrap(hd)  # remove +/-pi discontinuities
+                        delta = float(hd[-1] - hd[0])
+                        thresh = 0.26 # threshold in radians (~15 degrees)
+                        if abs(delta) < thresh:
+                            lane_turn_direction[i] = self._turn_direction_type.index('NONE')
+                        elif delta > 0:
+                            lane_turn_direction[i] = self._turn_direction_type.index('LEFT')
+                        else:
+                            lane_turn_direction[i] = self._turn_direction_type.index('RIGHT')
+                    # lane traffic control is extremely slow at the moment (multiple days)
+                    # if lane_token not in lane_tokens['lane_connector']:
+                    #     lane_traffic_control[i] = 0
+                    # else:
+                    #     lane_traffic_control[i] = int(self.lane_has_stop_line_fast(nusc_map, pts_t))
+                    lane_traffic_control[i] = 0
 
-                    # predecessor / successor
-                    for pred in lane_record.get('predecessors', []):
-                        if pred in lane_token_to_idx:
-                            lane_predecessor_edge_index.append(
-                                [lane_token_to_idx[pred], i]
-                            )
-
-                    for succ in lane_record.get('successors', []):
-                        if succ in lane_token_to_idx:
-                            lane_successor_edge_index.append(
-                                [i, lane_token_to_idx[succ]]
-                            )
-
-                    # adjacent lanes (left / right)
-                    for adj in lane_record.get('adjacent_lanes', []):
-                        if adj in lane_token_to_idx:
-                            lane_adjacent_edge_index.append(
-                                [i, lane_token_to_idx[adj]]
-                            )
             # pack tensors
             data['lane'] = {
                 'num_nodes': num_lanes,
@@ -682,34 +861,25 @@ class NuScenesDataset(Dataset):
             }
 
             data['centerline'] = {
-                'position': centerline_position,
-                'heading': centerline_heading,
-                'length': centerline_length,
-                'num_nodes': num_centerlines
+                'position': torch.cat(centerline_position, dim=0),
+                'heading': torch.cat(centerline_heading, dim=0),
+                'length': torch.cat(centerline_length, dim=0),
+                'num_nodes': num_centerlines.sum().item()
             }
 
-            data[('centerline', 'lane')] = {
-                'edge_index': torch.stack([
-                    torch.arange(num_lanes).repeat_interleave(num_centerlines),
-                    torch.cat([torch.arange(n) for n in num_centerlines])
-                ], dim=0)
-            }
+            centerline_to_lane_edge_index = torch.stack([torch.arange(num_centerlines.sum(), dtype=torch.long), torch.arange(num_lanes, dtype=torch.long).repeat_interleave(num_centerlines)], dim=0)
+            data['centerline', 'lane']['centerline_to_lane_edge_index'] = centerline_to_lane_edge_index
 
-            data[('lane', 'lane')] = {
-                'adjacent_edge_index': torch.tensor(lane_adjacent_edge_index).T
-                if len(lane_adjacent_edge_index) > 0 else torch.empty(2, 0, dtype=torch.long),
-                'predecessor_edge_index': torch.tensor(lane_predecessor_edge_index).T
-                if len(lane_predecessor_edge_index) > 0 else torch.empty(2, 0, dtype=torch.long),
-                'successor_edge_index': torch.tensor(lane_successor_edge_index).T
-                if len(lane_successor_edge_index) > 0 else torch.empty(2, 0, dtype=torch.long),
+            # not easily available in nuscenes
+            data[('lane','lane')] = {
+                'adjacent_edge_index': torch.empty(2, 0, dtype=torch.long),
+                'predecessor_edge_index': torch.empty(2, 0, dtype=torch.long),
+                'successor_edge_index': torch.empty(2, 0, dtype=torch.long),
             }
 
             map_features.append(data)
-            break
 
         if save:
             torch.save(map_features, os.path.join(pth))
-        
-        raise NotImplementedError
-        
+                
         return map_features
