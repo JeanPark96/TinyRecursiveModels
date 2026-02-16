@@ -5,7 +5,7 @@ def compute_metrics(pred, targets, targets_mask, only_full=False, history_mask=N
     """
     Returns scalar ADE, FDE, and miss rate (averaged over valid agents+timesteps).
     
-    pred: prediction [B, F, AF, 2]
+    pred: prediction [B, AF, F, 2]
     targets: groundtruth [B, F, AF, 7]
     targets_mask: mask over groundtruth [B, F, AF]
     only_full: compute metrics only on full history/future trajectories

@@ -519,7 +519,7 @@ class TRM_ACT_NuScenes(nn.Module):
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
             halted = is_last_step
-
+            
             if self.training and (self.config.halt_max_steps > 1):
                 if self.config.no_ACT_continue:
                     halted = halted | (q_halt_logits > 0)

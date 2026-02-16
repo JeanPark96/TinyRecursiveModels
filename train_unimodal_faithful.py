@@ -232,7 +232,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "L_cycles": args.L_cycles,
             "H_layers": 0,
             "L_layers": 2,
-            "pos_encodings": "none",  # can switch to "rope" later
+            "pos_encodings": args.pos_encodings,  # can switch to "rope" later
 
             "halt_max_steps": args.halt_max_steps,
             "halt_exploration_prob": 0.0,
@@ -242,6 +242,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             "forward_dtype": "float32",
             "mlp_t": False,
             "halt_config_name": args.halt_config,
+
+            'ema': args.ema, # use Exponential-Moving-Average
+            'ema_rate': args.ema_rate, # EMA-rate
         }
 
         with open(os.path.join("./config", f"{RUN_NAME}.json"), "w") as f:
@@ -301,6 +304,14 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
         optimizer_lr_warmup_steps=2000,
         carry=None
     )
+
+    ema_helper = None
+    if config_dict['ema']:
+        if args.resume:
+            raise NotImplementedError('EMA helper with resume not implemented')
+        print('Setup EMA')
+        ema_helper = EMAHelper(mu=config_dict['ema_rate'])
+        ema_helper.register(train_state.model)
     
     # --- Plot BEFORE training/resume (using current model state) ---
     plot_debug_batch(
@@ -351,6 +362,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             }
 
             metrics, outputs = train_batch(train_state, model_input)
+
+            if config_dict['ema']:
+                ema_helper.update(train_state.model)
 
             # calc extra metrics
             batch_targets = train_state.carry.current_data['targets'] # accommodate asynchronous deep supervision
@@ -407,8 +421,15 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
         ############ Evaluation
         if epoch % 1 == 0:
+            if config_dict['ema']:
+                print("SWITCH TO EMA")
+                train_state_eval = copy.deepcopy(train_state)
+                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+            else:
+                train_state_eval = train_state
+
             logger.log("Running Validation...")
-            train_state.model.eval()
+            train_state_eval.model.eval()
             val_ade_sum = val_fde_sum = val_ade_real_sum = val_fde_real_sum = val_loss_sum = val_mr_sum = 0.0
             val_n = 0
 
@@ -434,13 +455,13 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                     }
 
                     with torch.device("cuda"):
-                        carry = train_state.model.initial_carry(model_input)  # type: ignore
+                        carry = train_state_eval.model.initial_carry(model_input)  # type: ignore
 
                     # Forward
                     inference_steps = 0
                     while True:
                         # print(inference_steps+1)
-                        carry, loss, metrics, outputs, all_finish = train_state.model(
+                        carry, loss, metrics, outputs, all_finish = train_state_eval.model(
                             carry=carry, batch=model_input, return_keys=["pred", "pred_recursions"]
                         )
                         inference_steps += 1
@@ -515,7 +536,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
             ############ Checkpointing
             epoch_ckpt_path = os.path.join(run_ckpt_dir, f"epoch_{epoch+1}.pth")
             ckpt_payload = {
-                "model": model.state_dict(),
+                "model": train_state_eval.model.state_dict(), #model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "global_step": global_step, # note: this is meaningless in this ver (can't track global steps bc deep supervision is asynchronous)
                 "epoch": epoch,  # 0-based
@@ -542,7 +563,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
                 # --- Plot debug batch AFTER this epoch if val loss improving ---
                 plot_debug_batch(
-                    train_state,
+                    train_state_eval,
                     val_dataset,
                     debug_batch,
                     rdm_agents,
@@ -556,7 +577,7 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
 
                 if ood_dataloader is not None:
                     plot_debug_batch(
-                        train_state,
+                        train_state_eval,
                         ood_dataset,
                         ood_debug_batch,
                         ood_rdm_agents,
@@ -567,6 +588,9 @@ def train(args, tr_dataset, val_dataset, test_dataset, ood_dataset, tr_dataloade
                         out_slice=config_dict["out_slice"],
                         sub_name=args.tboard_name,
                     )
+
+            if config_dict['ema']:
+                del train_state_eval
 
         logger.log("-" * 30)
 
@@ -586,9 +610,12 @@ if __name__ == "__main__":
     parser.add_argument("--halt_max_steps", type=int, default=1)
     parser.add_argument("--H_cycles", type=int, default=3)
     parser.add_argument("--L_cycles", type=int, default=6)
+    parser.add_argument("--pos_encodings", type=str, default="none", choices=["none","rope","learned"], help="Type of positional encoding.")
     parser.add_argument("--config_batch_size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=4501)
     parser.add_argument("--resume", action="store_true", help="Resume training from last checkpoint if available")
+    parser.add_argument("--ema", action="store_true", help="Use EMA")
+    parser.add_argument("--ema_rate", type=float, default=0.999, help="EMA rate")
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU id to use (0-based)")
     parser.add_argument('--split_type', type=str, default='standard', help='Dataset split methods. OOD splits of type oodType are named with convention oodType-oodSubType, where oodSubType does not appear in the ID train/val/test distribution.',
                                     choices=['standard',
