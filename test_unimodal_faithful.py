@@ -32,22 +32,23 @@ from utils.metrics import compute_metrics, compute_menger_curvature
 import argparse
 from utils.log import Logger
 from utils.debug import plot_trajectories, plot_test_batch
-from models.losses import ACTLossHeadNuScenes
+from models.act_losses import ACTLossHeadNuScenes
 import random
 import numpy as np
 import json
 import datetime
 import sys
 import importlib
-import models.recursive_reasoning.trm_unimodal_v6 as trm_unimodal
+import models.recursive_reasoning.trm_unimodal_v4 as trm_unimodal
 from torch.utils.tensorboard import SummaryWriter
 import torch.optim as optim
+from utils.halt_helper import load_yaml, build_act_head_kwargs_from_yaml
 
 importlib.reload(trm_unimodal)
 # --- IMPORTS ---
 # Ensure these imports match your file structure
 # from my_dataset import NuScenesMiniDataset, custom_collate 
-from models.recursive_reasoning.trm_unimodal_v6 import (
+from models.recursive_reasoning.trm_unimodal_v4 import (
     TRM_ACT_NuScenes,
     TRM_ACT_NuScenes_Config
 )
@@ -118,6 +119,14 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     global_step = ckpt.get("global_step", 0)
     best_val_loss = ckpt.get("best_val_loss", float("inf"))
 
+    # load halting 
+    halt_cfg_raw = load_yaml(config_dict['halt_config_name'])
+    act_head_kwargs = build_act_head_kwargs_from_yaml(halt_cfg_raw)
+
+    if act_head_kwargs["denorm"]:
+        act_head_kwargs["std_xy"] = std_xy
+        act_head_kwargs["mean_xy"] = mean_xy
+
     # Initialize Logger
     logger = Logger(LOG_DIR, RUN_NAME, config_dict)
     logger.log("Loading Dataset...")
@@ -133,7 +142,9 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
         step=0,
         total_steps=0, # unused for now
 
-        model=ACTLossHeadNuScenes(model=model),
+        # model=ACTLossHeadNuScenes(model=model),
+        model=ACTLossHeadNuScenes(model=model, 
+                                    **act_head_kwargs),
         optimizers=[None],
         optimizer_lrs=[None],
         optimizer_lr_schedule=False,
@@ -152,6 +163,7 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     n = 0
     batch_losses, ade_reals, fde_reals, mrs, hist_curv, fut_curv, batch_masks = [], [], [], [], [], [], []
     agent_losses, agent_ade_reals, agent_fde_reals, agent_mrs, types, track_masks = [], [], [], [], [], []
+    hists, masks = [], []
     with torch.no_grad():
         for b, batch in enumerate(tqdm(dataloader)):
             # if b % 10 == 0:
@@ -272,10 +284,13 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
             agent_mrs.append(agent_mr.flatten())
             obs_types = dataset.get_obs_type(batch["idx"])
             types.append(np.take_along_axis(obs_types,axis=1,indices=targets_idx.cpu().numpy()).flatten())
-            track_masks.append(full_track.flatten().cpu().numpy())
+            track_masks.append(full_track.cpu().numpy()) # don't flatten this right away, because may need to stratify by agent
+
+            hists.append(obs_pose)
+            masks.append(obs_mask)
 
             # plot recursions
-            if b == 0:
+            if b < 2:
                 pred_recursions = outputs["pred_recursions"] # [H_cycles, B, A*H+1, D]
                 # print(pred_recursions[:,0,0,0])
                 # raise NotImplementedError
@@ -343,24 +358,25 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     batch_masks = torch.cat(batch_masks)
     
     types = np.concatenate(types)
-    track_masks = np.concatenate(track_masks)
+    track_masks = np.concatenate(track_masks) # N, A
     agent_losses = torch.cat(agent_losses)
     agent_ade_reals = torch.cat(agent_ade_reals)
     agent_fde_reals = torch.cat(agent_fde_reals)
     agent_mrs = torch.cat(agent_mrs)
 
-    print(len(batch_losses), len(ade_reals), len(fde_reals), len(mrs), len(hist_curv), len(fut_curv))
-    print(len(hist_curv[batch_masks]), len(fut_curv[batch_masks]))
+    hists = torch.cat(hists) # N, H, A, 7
+    masks = torch.cat(masks) # N, H, A
+
     assert len(batch_losses) == len(hist_curv) == len(fut_curv)
     assert len(ade_reals) == len(fde_reals) == len(mrs) == len(hist_curv[batch_masks]) == len(fut_curv[batch_masks])
     assert len(agent_losses) == len(types)
-    assert len(agent_ade_reals) == len(agent_fde_reals) == len(agent_mrs) == len(types[track_masks])
+    assert len(agent_ade_reals) == len(agent_fde_reals) == len(agent_mrs) == len(types[track_masks.flatten()])
 
     # based on object type
     rows = []
     for obj_type in np.unique(types):
         type_match = (types == obj_type)
-        full_track_type_match = (types[track_masks] == obj_type)
+        full_track_type_match = (types[track_masks.flatten()] == obj_type)
         logger.log(
             f"{obj_type}: "
             f"Loss: {agent_losses[type_match].mean():.4f} | " # computed over any track
@@ -416,13 +432,79 @@ def eval(args, dataset, dataloader, stats, mean_xy, std_xy, ood=False):
     curvature_v_metric(hist_curv[batch_masks], fut_curv[batch_masks], fde_reals.cpu().numpy(), 'FDE (m)', f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/curvature_v_fde.png')
     curvature_v_metric(hist_curv[batch_masks], fut_curv[batch_masks], mrs.cpu().numpy(), 'miss rate', f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/curvature_v_mr.png')
 
+    # based on number of other agents
+    n_agents_per_sample = np.sum(track_masks,axis=1)
+    for (name, metric) in [('ade', ade_reals), ('fde', fde_reals), ('mr', mrs)]:
+        # plt.scatter(n_agents_per_sample[batch_masks], metric.cpu().numpy())
+        # plt.ylabel(name.upper())
+        # plt.xlabel('Number of agents')
+        # plt.savefig(f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/nagents_v_{name}.png')
+        # plt.close()
+        
+        hb = plt.hexbin(
+            n_agents_per_sample[batch_masks], metric.cpu().numpy(),
+            gridsize=60,      # increase for finer resolution (e.g., 100)
+            mincnt=1,         # hide empty bins
+            bins='log',        # log density makes structure visible
+            cmap="viridis"
+        )
+        plt.colorbar(hb, label="log10(count)")
+        plt.ylabel(name.upper())
+        plt.xlabel('Number of agents')
+        plt.savefig(f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/nagents_v_{name}.png')
+        plt.close()
+
+    # based on number of agents within 10 m radius
+    rad = 1
+    current_dists = np.linalg.norm(hists[:,-1,:,:2].cpu().numpy(), axis=-1) # N, A
+    within_rad = current_dists < rad
+    n_agents_within_rad = np.sum(within_rad, axis=1)
+    for (name, metric) in [('ade', ade_reals), ('fde', fde_reals), ('mr', mrs)]:
+        # plt.scatter(n_agents_within_rad[batch_masks], metric.cpu().numpy())
+        # plt.ylabel(name.upper())
+        # plt.xlabel(f'Number of agents in {rad} m radius')
+        # plt.savefig(f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/nagents_in_{rad}_v_{name}.png')
+        # plt.close()
+        hb = plt.hexbin(
+            n_agents_within_rad[batch_masks], metric.cpu().numpy(),
+            gridsize=60,      # increase for finer resolution (e.g., 100)
+            mincnt=1,         # hide empty bins
+            bins='log',        # log density makes structure visible
+            cmap="viridis"
+        )
+        plt.colorbar(hb, label="log10(count)")
+        plt.ylabel(name.upper())
+        plt.xlabel(f'Number of agents in {rad} m radius')
+        plt.savefig(f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/nagents_in_{rad}_v_{name}.png')
+        plt.close()
+
+    # based on min distance from other agents
+    min_dist = np.min(current_dists, axis=1)
+    for (name, metric) in [('ade', ade_reals), ('fde', fde_reals), ('mr', mrs)]:
+        # plt.scatter(min_dist[batch_masks], metric.cpu().numpy())
+        # plt.ylabel(name.upper())
+        # plt.xlabel(f'Minimum distance from agent')
+        # plt.savefig(f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/mindist_v_{name}.png')
+        # plt.close()
+        hb = plt.hexbin(
+            min_dist[batch_masks], metric.cpu().numpy(),
+            gridsize=60,      # increase for finer resolution (e.g., 100)
+            mincnt=1,         # hide empty bins
+            bins='log',        # log density makes structure visible
+            cmap="viridis"
+        )
+        plt.colorbar(hb, label="log10(count)")
+        plt.ylabel(name.upper())
+        plt.xlabel(f'Minimum distance from agent')
+        plt.savefig(f'plot_figures/test_{RUN_NAME}/{args.tboard_name}/mindist_v_{name}.png')
+        plt.close()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--run_name", type=str, default="trm_av_unimodal_experiment_norm_v1")
     parser.add_argument("--tboard_name", type=str, help="Name for tensorboard run")
     parser.add_argument("--model_pth", type=str)
     parser.add_argument("--hidden_size", type=int, default=256)
-    parser.add_argument("--halt_max_steps", type=int, default=16)
     parser.add_argument("--config_batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=4501)
     parser.add_argument("--gpu_id", type=int, default=0, help="GPU id to use (0-based)")
